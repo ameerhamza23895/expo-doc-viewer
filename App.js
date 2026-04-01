@@ -15,6 +15,7 @@ import { StatusBar } from 'expo-status-bar';
 import * as DocumentPicker from 'expo-document-picker';
 import { File, Paths } from 'expo-file-system';
 import * as LegacyFileSystem from 'expo-file-system/legacy';
+import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
 import {
   BlendMode,
@@ -25,6 +26,8 @@ import {
 } from 'pdf-lib';
 import { WebView } from 'react-native-webview';
 import { getPdfViewerHtml } from './src/utils/pdfViewerHtml';
+import { getPdfConverterHtml } from './src/utils/pdfConverterHtml';
+import { getOfficePreviewHtml } from './src/utils/officePreviewHtml';
 
 const TOOLS = [
   { id: 'view', label: '👆 Select' },
@@ -45,6 +48,41 @@ const DEFAULT_COLOR = COLORS[0].value;
 const HIGHLIGHT_ALPHA_HEX = '66';
 const ANNOTATION_STORAGE_DIR = `${Paths.document.uri}annotation-state/`;
 const WORKING_PDF_SUFFIX = '.working.pdf';
+const OFFICE_PREVIEW_TYPES = ['doc', 'docx', 'pptx', 'xls', 'xlsx'];
+const PDF_CONVERSION_FORMATS = [
+  {
+    id: 'docx',
+    label: '📝 Word (.docx)',
+    extension: 'docx',
+    mimeType:
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  },
+  {
+    id: 'pptx',
+    label: '📊 PowerPoint (.pptx)',
+    extension: 'pptx',
+    mimeType:
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  },
+  {
+    id: 'txt',
+    label: '📄 Text (.txt)',
+    extension: 'txt',
+    mimeType: 'text/plain',
+  },
+  {
+    id: 'md',
+    label: '📘 Markdown (.md)',
+    extension: 'md',
+    mimeType: 'text/markdown',
+  },
+  {
+    id: 'html',
+    label: '🌐 HTML (.html)',
+    extension: 'html',
+    mimeType: 'text/html',
+  },
+];
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -157,12 +195,19 @@ function sanitizeFileSegment(value = 'document') {
   );
 }
 
-function buildAnnotatedFileName(documentName) {
-  const timestamp = new Date()
+function buildTimestampToken() {
+  return new Date()
     .toISOString()
     .replace(/[^0-9]/g, '')
     .slice(0, 14);
-  return `${sanitizeFileSegment(documentName)}_annotated_${timestamp}.pdf`;
+}
+
+function buildAnnotatedFileName(documentName) {
+  return `${sanitizeFileSegment(documentName)}_annotated_${buildTimestampToken()}.pdf`;
+}
+
+function buildConvertedFileName(documentName, extension) {
+  return `${sanitizeFileSegment(documentName)}_converted_${buildTimestampToken()}.${extension}`;
 }
 
 function parseHexColor(hexColor, fallbackOpacity = 1) {
@@ -419,7 +464,7 @@ function getSelectedAnnotationDescription(selectedAnnotation) {
   return `Selected ${label} on page ${selectedAnnotation.page}.`;
 }
 
-async function savePdfToAndroidDeviceFolder(base64Contents, fileName) {
+async function saveBase64ToAndroidDeviceFolder(base64Contents, fileName, mimeType) {
   if (
     Platform.OS !== 'android' ||
     !LegacyFileSystem.StorageAccessFramework
@@ -442,7 +487,7 @@ async function savePdfToAndroidDeviceFolder(base64Contents, fileName) {
     const targetUri = await LegacyFileSystem.StorageAccessFramework.createFileAsync(
       permission.directoryUri,
       fileName,
-      'application/pdf'
+      mimeType
     );
 
     await LegacyFileSystem.StorageAccessFramework.writeAsStringAsync(
@@ -467,6 +512,14 @@ async function savePdfToAndroidDeviceFolder(base64Contents, fileName) {
   }
 }
 
+async function savePdfToAndroidDeviceFolder(base64Contents, fileName) {
+  return saveBase64ToAndroidDeviceFolder(
+    base64Contents,
+    fileName,
+    'application/pdf'
+  );
+}
+
 export default function App() {
   const [documentUri, setDocumentUri] = useState(null);
   const [documentName, setDocumentName] = useState('');
@@ -486,13 +539,31 @@ export default function App() {
   const [textNoteModal, setTextNoteModal] = useState(null);
   const [noteText, setNoteText] = useState('');
   const [showPageEditorModal, setShowPageEditorModal] = useState(false);
+  const [showConvertModal, setShowConvertModal] = useState(false);
+  const [conversionTask, setConversionTask] = useState(null);
+  const [conversionStatus, setConversionStatus] = useState('');
+  const [officePreviewMeta, setOfficePreviewMeta] = useState({
+    previewKind: '',
+    canConvertToPdf: false,
+    isEditable: false,
+  });
+  const [officePdfBusy, setOfficePdfBusy] = useState(false);
   const [pageNumberInput, setPageNumberInput] = useState('1');
   const [pageEditorBusy, setPageEditorBusy] = useState(false);
   const [viewerInstanceId, setViewerInstanceId] = useState(0);
 
   const webViewRef = useRef(null);
+  const conversionChunksRef = useRef({
+    fileName: '',
+    mimeType: '',
+    chunks: [],
+  });
   const annotationWriteQueueRef = useRef(Promise.resolve());
   const annotationDirectoryReadyRef = useRef(false);
+  const officePreviewExportRef = useRef({
+    requestId: null,
+    chunks: [],
+  });
 
   const ensureAnnotationStorageDirectory = useCallback(async () => {
     if (annotationDirectoryReadyRef.current) {
@@ -654,18 +725,19 @@ export default function App() {
     return base64Data;
   }, [base64Data, documentKey, loadWorkingPdfCopy]);
 
+  const buildEditedPdfBase64 = useCallback(async () => {
+    const editablePdfBase64 = await loadEditablePdfBase64();
+
+    if (!editablePdfBase64) {
+      throw new Error('No editable PDF data found.');
+    }
+
+    return bakePdfWithAnnotations(editablePdfBase64, annotationState);
+  }, [annotationState, loadEditablePdfBase64]);
+
   const buildEditedPdfFile = useCallback(
     async (outputDirectoryUri = Paths.cache.uri) => {
-      const editablePdfBase64 = await loadEditablePdfBase64();
-
-      if (!editablePdfBase64) {
-        throw new Error('No editable PDF data found.');
-      }
-
-      const bakedPdfBase64 = await bakePdfWithAnnotations(
-        editablePdfBase64,
-        annotationState
-      );
+      const bakedPdfBase64 = await buildEditedPdfBase64();
       const fileName = buildAnnotatedFileName(documentName);
       const outputUri = `${outputDirectoryUri}${fileName}`;
 
@@ -679,7 +751,7 @@ export default function App() {
         outputUri,
       };
     },
-    [annotationState, documentName, loadEditablePdfBase64]
+    [buildEditedPdfBase64, documentName]
   );
 
   const promptForPdfShareChoice = useCallback(
@@ -719,6 +791,29 @@ export default function App() {
       }),
     []
   );
+
+  const resetConversionState = useCallback(() => {
+    conversionChunksRef.current = {
+      fileName: '',
+      mimeType: '',
+      chunks: [],
+    };
+    setConversionTask(null);
+    setConversionStatus('');
+  }, []);
+
+  const resetOfficePreviewState = useCallback(() => {
+    officePreviewExportRef.current = {
+      requestId: null,
+      chunks: [],
+    };
+    setOfficePreviewMeta({
+      previewKind: '',
+      canConvertToPdf: false,
+      isEditable: false,
+    });
+    setOfficePdfBusy(false);
+  }, []);
 
   const persistAnnotationState = useCallback(
     (nextDocumentKey, nextAnnotations) => {
@@ -819,6 +914,10 @@ export default function App() {
             case 'deleteSelected':
               typeof deleteSelectedAnnotation === 'function' && deleteSelectedAnnotation();
               break;
+            case 'exportPreview':
+              typeof handleOfficePreviewCommand === 'function' &&
+                handleOfficePreviewCommand(parsed);
+              break;
           }
         } catch (error) {
           console.error('Command error:', error);
@@ -904,13 +1003,23 @@ export default function App() {
         setViewerHtml(buildViewerHtml(activeBase64, nextAnnotations, 'view', 1));
         setViewerInstanceId((currentValue) => currentValue + 1);
         setShowPageEditorModal(false);
+        setShowConvertModal(false);
+        resetConversionState();
+        resetOfficePreviewState();
         setPageNumberInput('1');
       } else {
+        const shouldLoadPreviewBase64 = OFFICE_PREVIEW_TYPES.includes(extension);
+        const nextBase64 = shouldLoadPreviewBase64
+          ? await LegacyFileSystem.readAsStringAsync(file.uri, {
+              encoding: LegacyFileSystem.EncodingType.Base64,
+            })
+          : null;
+
         setDocumentUri(file.uri);
         setDocumentName(file.name);
         setDocumentType(extension);
         setDocumentKey(null);
-        setBase64Data(null);
+        setBase64Data(nextBase64);
         setTotalPages(0);
         setTextNoteModal(null);
         setNoteText('');
@@ -923,6 +1032,9 @@ export default function App() {
         setViewerHtml(null);
         setViewerInstanceId((currentValue) => currentValue + 1);
         setShowPageEditorModal(false);
+        setShowConvertModal(false);
+        resetConversionState();
+        resetOfficePreviewState();
         setPageNumberInput('1');
       }
     } catch (error) {
@@ -936,6 +1048,8 @@ export default function App() {
     loadPersistedAnnotations,
     loadWorkingPdfCopy,
     promptForPdfResumeChoice,
+    resetConversionState,
+    resetOfficePreviewState,
   ]);
 
   const copyDocument = useCallback(async () => {
@@ -994,6 +1108,220 @@ export default function App() {
       Alert.alert('Error', 'Failed to share: ' + error.message);
     }
   }, [buildEditedPdfFile, documentType, documentUri, promptForPdfShareChoice]);
+
+  const convertOfficePreviewToPdf = useCallback(() => {
+    if (!officePreviewMeta.canConvertToPdf || officePdfBusy) {
+      return;
+    }
+
+    const requestId = Date.now().toString();
+    officePreviewExportRef.current = {
+      requestId,
+      chunks: [],
+    };
+    setOfficePdfBusy(true);
+
+    sendCommand({
+      command: 'exportPreview',
+      requestId,
+      title: documentName,
+    });
+  }, [documentName, officePdfBusy, officePreviewMeta.canConvertToPdf, sendCommand]);
+
+  const startPdfConversion = useCallback(
+    async (formatId) => {
+      if (documentType !== 'pdf') {
+        return;
+      }
+
+      const formatConfig = PDF_CONVERSION_FORMATS.find(
+        (conversionFormat) => conversionFormat.id === formatId
+      );
+
+      if (!formatConfig) {
+        return;
+      }
+
+      try {
+        setShowConvertModal(false);
+        setConversionStatus('Preparing edited PDF...');
+
+        const bakedPdfBase64 = await buildEditedPdfBase64();
+        const outputFileName = buildConvertedFileName(
+          documentName,
+          formatConfig.extension
+        );
+
+        conversionChunksRef.current = {
+          fileName: outputFileName,
+          mimeType: formatConfig.mimeType,
+          chunks: [],
+        };
+
+        setConversionTask({
+          id: Date.now().toString(),
+          formatId,
+          formatLabel: formatConfig.label,
+          fileName: outputFileName,
+          mimeType: formatConfig.mimeType,
+          html: getPdfConverterHtml(bakedPdfBase64, {
+            format: formatId,
+            fileName: outputFileName,
+            mimeType: formatConfig.mimeType,
+          }),
+        });
+      } catch (error) {
+        resetConversionState();
+        Alert.alert('Conversion Failed', error.message);
+      }
+    },
+    [buildEditedPdfBase64, documentName, documentType, resetConversionState]
+  );
+
+  const finalizeOfficePreviewPdfExport = useCallback(
+    async (html) => {
+      const convertedFileName = buildConvertedFileName(documentName, 'pdf');
+      const printResult = await Print.printToFileAsync({
+        html,
+      });
+      const convertedPdfBase64 = await LegacyFileSystem.readAsStringAsync(
+        printResult.uri,
+        {
+          encoding: LegacyFileSystem.EncodingType.Base64,
+        }
+      );
+      const outputUri = `${Paths.document.uri}${convertedFileName}`;
+
+      await LegacyFileSystem.writeAsStringAsync(outputUri, convertedPdfBase64, {
+        encoding: LegacyFileSystem.EncodingType.Base64,
+      });
+
+      const deviceSaveResult =
+        Platform.OS === 'android'
+          ? await savePdfToAndroidDeviceFolder(convertedPdfBase64, convertedFileName)
+          : { savedToDevice: false, reason: 'unsupported_platform' };
+
+      const canShare = await Sharing.isAvailableAsync();
+      const saveSummary = [`Saved in app storage as ${convertedFileName}.`];
+
+      if (deviceSaveResult.savedToDevice) {
+        saveSummary.push(
+          'A second copy was also saved to the folder you picked on your phone.'
+        );
+      } else if (Platform.OS === 'android') {
+        saveSummary.push(
+          'The visible device copy was not created. Next time, allow the folder picker to save directly into phone storage.'
+        );
+      }
+
+      Alert.alert('PDF Created', saveSummary.join(' '), [
+        ...(canShare
+          ? [
+              {
+                text: 'Share',
+                onPress: () => Sharing.shareAsync(outputUri),
+              },
+            ]
+          : []),
+        { text: 'OK' },
+      ]);
+    },
+    [documentName]
+  );
+
+  const handleConverterMessage = useCallback(
+    async (event) => {
+      try {
+        const data = JSON.parse(event.nativeEvent.data);
+
+        switch (data.type) {
+          case 'conversionStatus':
+            setConversionStatus(data.message || 'Converting document...');
+            break;
+          case 'conversionMeta':
+            conversionChunksRef.current = {
+              fileName: data.fileName || '',
+              mimeType: data.mimeType || 'application/octet-stream',
+              chunks: new Array(Math.max(Number(data.totalChunks) || 0, 0)).fill(''),
+            };
+            break;
+          case 'conversionChunk':
+            if (
+              Number.isInteger(data.index) &&
+              conversionChunksRef.current.chunks[data.index] !== undefined
+            ) {
+              conversionChunksRef.current.chunks[data.index] = data.chunk || '';
+            }
+            break;
+          case 'conversionComplete': {
+            const { fileName, mimeType, chunks } = conversionChunksRef.current;
+            const convertedBase64 = chunks.join('');
+
+            if (!fileName || !convertedBase64) {
+              throw new Error('Converted document data was incomplete.');
+            }
+
+            const outputUri = `${Paths.document.uri}${fileName}`;
+            await LegacyFileSystem.writeAsStringAsync(outputUri, convertedBase64, {
+              encoding: LegacyFileSystem.EncodingType.Base64,
+            });
+
+            const deviceSaveResult =
+              Platform.OS === 'android'
+                ? await saveBase64ToAndroidDeviceFolder(
+                    convertedBase64,
+                    fileName,
+                    mimeType
+                  )
+                : { savedToDevice: false, reason: 'unsupported_platform' };
+
+            const canShare = await Sharing.isAvailableAsync();
+            const saveSummary = [`Saved in app storage as ${fileName}.`];
+
+            if (deviceSaveResult.savedToDevice) {
+              saveSummary.push(
+                'A second copy was also saved to the folder you picked on your phone.'
+              );
+            } else if (Platform.OS === 'android') {
+              saveSummary.push(
+                'The visible device copy was not created. Next time, allow the folder picker to save directly into phone storage.'
+              );
+            }
+
+            resetConversionState();
+
+            Alert.alert('Document Converted', saveSummary.join(' '), [
+              ...(canShare
+                ? [
+                    {
+                      text: 'Share',
+                      onPress: () =>
+                        Sharing.shareAsync(outputUri, {
+                          mimeType,
+                        }),
+                    },
+                  ]
+                : []),
+              { text: 'OK' },
+            ]);
+            break;
+          }
+          case 'conversionError':
+            resetConversionState();
+            Alert.alert(
+              'Conversion Failed',
+              data.message ||
+                'The document could not be converted. Check your connection and try again.'
+            );
+            break;
+        }
+      } catch (error) {
+        resetConversionState();
+        Alert.alert('Conversion Failed', error.message);
+      }
+    },
+    [resetConversionState]
+  );
 
   const selectTool = useCallback(
     (toolId) => {
@@ -1330,6 +1658,67 @@ export default function App() {
             }
             setShowPageEditorModal(true);
             break;
+          case 'officePreviewReady':
+            setOfficePreviewMeta({
+              previewKind: data.previewKind || '',
+              canConvertToPdf: !!data.canConvertToPdf,
+              isEditable: !!data.isEditable,
+            });
+            setOfficePdfBusy(false);
+            break;
+          case 'officePreviewExportMeta':
+            if (data.requestId === officePreviewExportRef.current.requestId) {
+              officePreviewExportRef.current = {
+                requestId: data.requestId,
+                chunks: new Array(Math.max(Number(data.totalChunks) || 0, 0)).fill(''),
+              };
+            }
+            break;
+          case 'officePreviewExportChunk':
+            if (
+              data.requestId === officePreviewExportRef.current.requestId &&
+              Number.isInteger(data.index) &&
+              officePreviewExportRef.current.chunks[data.index] !== undefined
+            ) {
+              officePreviewExportRef.current.chunks[data.index] = data.chunk || '';
+            }
+            break;
+          case 'officePreviewExportComplete':
+            if (data.requestId === officePreviewExportRef.current.requestId) {
+              const html = officePreviewExportRef.current.chunks.join('');
+              officePreviewExportRef.current = {
+                requestId: null,
+                chunks: [],
+              };
+
+              if (!html) {
+                setOfficePdfBusy(false);
+                Alert.alert('PDF Conversion Failed', 'Office preview export was empty.');
+                break;
+              }
+
+              finalizeOfficePreviewPdfExport(html)
+                .catch((error) => {
+                  Alert.alert('PDF Conversion Failed', error.message);
+                })
+                .finally(() => {
+                  setOfficePdfBusy(false);
+                });
+            }
+            break;
+          case 'officePreviewExportError':
+            if (data.requestId === officePreviewExportRef.current.requestId) {
+              officePreviewExportRef.current = {
+                requestId: null,
+                chunks: [],
+              };
+              setOfficePdfBusy(false);
+              Alert.alert(
+                'PDF Conversion Failed',
+                data.message || 'This document preview could not be exported.'
+              );
+            }
+            break;
           case 'annotationsChanged': {
             const nextAnnotations = normalizeAnnotationState(data.annotations);
             setAnnotationState(nextAnnotations);
@@ -1370,7 +1759,14 @@ export default function App() {
         }
       } catch (_) {}
     },
-    [activeColor, activeTool, documentKey, persistAnnotationState, sendCommand]
+    [
+      activeColor,
+      activeTool,
+      documentKey,
+      finalizeOfficePreviewPdfExport,
+      persistAnnotationState,
+      sendCommand,
+    ]
   );
 
   const submitTextNote = useCallback(() => {
@@ -1414,7 +1810,14 @@ export default function App() {
     if (['doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx'].includes(extension)) {
       return (
         <View style={styles.nonPdfContainer}>
-          <OfficeDocViewer uri={documentUri} name={documentName} />
+          <OfficeDocViewer
+            uri={documentUri}
+            name={documentName}
+            extension={documentType}
+            base64Data={base64Data}
+            onMessage={handleWebViewMessage}
+            webViewRef={webViewRef}
+          />
         </View>
       );
     }
@@ -1484,6 +1887,18 @@ export default function App() {
                   <TouchableOpacity
                     style={[
                       styles.actionBtn,
+                      !!conversionTask && styles.actionBtnDisabled,
+                    ]}
+                    disabled={!!conversionTask}
+                    onPress={() => setShowConvertModal(true)}
+                  >
+                    <Text style={styles.actionBtnText}>
+                      {conversionTask ? '⏳ Converting...' : '🔁 Convert'}
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[
+                      styles.actionBtn,
                       pageEditorBusy && styles.actionBtnDisabled,
                     ]}
                     disabled={pageEditorBusy}
@@ -1526,6 +1941,20 @@ export default function App() {
                   </TouchableOpacity>
                 </>
               )}
+              {documentType !== 'pdf' && officePreviewMeta.canConvertToPdf && (
+                <TouchableOpacity
+                  style={[
+                    styles.actionBtnPrimary,
+                    officePdfBusy && styles.actionBtnDisabled,
+                  ]}
+                  disabled={officePdfBusy}
+                  onPress={convertOfficePreviewToPdf}
+                >
+                  <Text style={styles.actionBtnPrimaryText}>
+                    {officePdfBusy ? '⏳ Converting to PDF...' : '🧾 Convert to PDF'}
+                  </Text>
+                </TouchableOpacity>
+              )}
             </ScrollView>
           </View>
 
@@ -1535,6 +1964,15 @@ export default function App() {
                 {activeTool === 'view'
                   ? getSelectedAnnotationDescription(selectedAnnotation)
                   : 'Switch to Select mode to tap an annotation before deleting it.'}
+              </Text>
+            </View>
+          )}
+
+          {documentType !== 'pdf' && officePreviewMeta.isEditable && (
+            <View style={styles.selectionBar}>
+              <Text style={styles.selectionText}>
+                Basic text editing is available in this preview. Use `Convert to PDF`
+                to save the current preview as a PDF copy.
               </Text>
             </View>
           )}
@@ -1639,6 +2077,83 @@ export default function App() {
                 <Text style={styles.modalBtnSubmitText}>Add Note</Text>
               </TouchableOpacity>
             </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={showConvertModal}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setShowConvertModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>Convert PDF</Text>
+            <Text style={styles.pageEditorHint}>
+              Converts the current edited PDF copy into another editable document
+              format. Inserted or removed pages are included.
+            </Text>
+            <Text style={styles.convertHint}>
+              Word, PowerPoint, and HTML now preserve each PDF page as a full
+              page image. Text and Markdown stay text-based for easier editing.
+            </Text>
+            {PDF_CONVERSION_FORMATS.map((formatConfig) => (
+              <TouchableOpacity
+                key={formatConfig.id}
+                style={styles.pageActionBtnPrimary}
+                onPress={() => startPdfConversion(formatConfig.id)}
+              >
+                <Text style={styles.pageActionBtnPrimaryText}>
+                  {formatConfig.label}
+                </Text>
+              </TouchableOpacity>
+            ))}
+            <View style={styles.modalButtons}>
+              <TouchableOpacity
+                style={styles.modalBtnCancel}
+                onPress={() => setShowConvertModal(false)}
+              >
+                <Text style={styles.modalBtnCancelText}>Close</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={!!conversionTask}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => {}}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>Converting Document</Text>
+            <Text style={styles.pageEditorHint}>
+              {conversionTask?.formatLabel || 'Preparing conversion...'}
+            </Text>
+            <ActivityIndicator
+              size="large"
+              color="#0d6e6e"
+              style={styles.convertLoader}
+            />
+            <Text style={styles.convertStatusText}>
+              {conversionStatus || 'Preparing conversion...'}
+            </Text>
+            {conversionTask ? (
+              <View style={styles.hiddenConverterWebView}>
+                <WebView
+                  key={conversionTask.id}
+                  source={{ html: conversionTask.html }}
+                  onMessage={handleConverterMessage}
+                  javaScriptEnabled={true}
+                  domStorageEnabled={true}
+                  originWhitelist={['*']}
+                  mixedContentMode="always"
+                />
+              </View>
+            ) : null}
           </View>
         </View>
       </Modal>
@@ -1749,29 +2264,21 @@ function TextFileViewer({ uri }) {
   );
 }
 
-function OfficeDocViewer({ uri, name }) {
+function OfficeDocViewer({
+  uri,
+  name,
+  extension,
+  base64Data,
+  onMessage,
+  webViewRef,
+}) {
   const [error, setError] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
 
   React.useEffect(() => {
-    (async () => {
-      try {
-        const extension = name.split('.').pop().toLowerCase();
-        const tempName = 'office_preview_' + Date.now() + '.' + extension;
-        const tempUri = Paths.cache.uri + tempName;
-
-        await LegacyFileSystem.copyAsync({
-          from: uri,
-          to: tempUri,
-        });
-
-        setIsLoading(false);
-      } catch (loadError) {
-        setError('Could not load document: ' + loadError.message);
-        setIsLoading(false);
-      }
-    })();
-  }, [name, uri]);
+    setError(null);
+    setIsLoading(false);
+  }, [base64Data, extension, name, uri]);
 
   if (isLoading) {
     return (
@@ -1790,65 +2297,77 @@ function OfficeDocViewer({ uri, name }) {
     );
   }
 
-  const officeHtml = `
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      <style>
-        body {
-          font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-          display: flex;
-          flex-direction: column;
-          align-items: center;
-          justify-content: center;
-          min-height: 100vh;
-          margin: 0;
-          background: #f5f5f5;
-          padding: 20px;
-          text-align: center;
-        }
-        .icon { font-size: 64px; margin-bottom: 16px; }
-        h2 { color: #333; margin-bottom: 8px; font-size: 18px; }
-        p { color: #666; font-size: 14px; line-height: 1.5; max-width: 300px; }
-        .filename {
-          color: #6200ee;
-          font-weight: 600;
-          word-break: break-all;
-          margin: 12px 0;
-          background: #ede7f6;
-          padding: 8px 16px;
-          border-radius: 8px;
-          font-size: 13px;
-        }
-        .tip {
-          margin-top: 20px;
-          padding: 12px 16px;
-          background: #e3f2fd;
-          border-radius: 8px;
-          color: #1565c0;
-          font-size: 12px;
-        }
-      </style>
-    </head>
-    <body>
-      <div class="icon">📄</div>
-      <h2>${name}</h2>
-      <p class="filename">${name}</p>
-      <p>This Office document has been imported successfully.</p>
-      <p>Use the <strong>Share</strong> button above to open it in Microsoft Office, Google Docs, or another editor on your device.</p>
-      <div class="tip">
-        Tip: Tap "Share" to open in your preferred Office app for full editing capabilities.
-      </div>
-    </body>
-    </html>
-  `;
+  const officeHtml =
+    base64Data && OFFICE_PREVIEW_TYPES.includes(extension)
+      ? getOfficePreviewHtml(base64Data, {
+          extension,
+          fileName: name,
+        })
+      : `
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <style>
+              body {
+                font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                min-height: 100vh;
+                margin: 0;
+                background: #f5f5f5;
+                padding: 20px;
+                text-align: center;
+              }
+              .icon { font-size: 64px; margin-bottom: 16px; }
+              h2 { color: #333; margin-bottom: 8px; font-size: 18px; }
+              p { color: #666; font-size: 14px; line-height: 1.5; max-width: 320px; }
+              .filename {
+                color: #6200ee;
+                font-weight: 600;
+                word-break: break-all;
+                margin: 12px 0;
+                background: #ede7f6;
+                padding: 8px 16px;
+                border-radius: 8px;
+                font-size: 13px;
+              }
+              .tip {
+                margin-top: 20px;
+                padding: 12px 16px;
+                background: #e3f2fd;
+                border-radius: 8px;
+                color: #1565c0;
+                font-size: 12px;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="icon">📄</div>
+            <h2>${name}</h2>
+            <p class="filename">${name}</p>
+            <p>This document opens best in its dedicated editor.</p>
+            <p>Use the <strong>Share</strong> button above to open it in Microsoft Office, PowerPoint, Excel, Google Docs, or another compatible app.</p>
+            <div class="tip">
+              In-app preview is available for DOC, DOCX, PPTX, XLSX, and XLS files.
+            </div>
+          </body>
+          </html>
+        `;
 
   return (
     <WebView
+      ref={webViewRef}
       source={{ html: officeHtml }}
       style={styles.webView}
       scrollEnabled={true}
+      onMessage={onMessage}
+      originWhitelist={['*']}
+      javaScriptEnabled={true}
+      domStorageEnabled={true}
+      mixedContentMode="always"
     />
   );
 }
@@ -2105,6 +2624,12 @@ const styles = StyleSheet.create({
     lineHeight: 19,
     marginBottom: 8,
   },
+  convertHint: {
+    color: '#6f7891',
+    fontSize: 12,
+    lineHeight: 18,
+    marginBottom: 16,
+  },
   pageEditorMeta: {
     color: '#6f7891',
     fontSize: 12,
@@ -2137,6 +2662,21 @@ const styles = StyleSheet.create({
     color: '#50637f',
     fontSize: 12,
     lineHeight: 18,
+  },
+  convertLoader: {
+    marginVertical: 12,
+  },
+  convertStatusText: {
+    color: '#35506d',
+    fontSize: 13,
+    lineHeight: 19,
+    textAlign: 'center',
+  },
+  hiddenConverterWebView: {
+    width: 1,
+    height: 1,
+    opacity: 0,
+    overflow: 'hidden',
   },
   pageActionBtn: {
     backgroundColor: '#8b1e2d',
