@@ -1,29 +1,36 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import {
-  StyleSheet,
-  Text,
-  View,
-  TouchableOpacity,
+  ActivityIndicator,
   Alert,
   Modal,
-  TextInput,
-  ScrollView,
-  ActivityIndicator,
   Platform,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as DocumentPicker from 'expo-document-picker';
 import { File, Paths } from 'expo-file-system';
 import * as LegacyFileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
+import {
+  BlendMode,
+  LineCapStyle,
+  PDFDocument,
+  StandardFonts,
+  rgb,
+} from 'pdf-lib';
 import { WebView } from 'react-native-webview';
 import { getPdfViewerHtml } from './src/utils/pdfViewerHtml';
 
 const TOOLS = [
-  { id: 'view', label: '👁 View', icon: '👁' },
-  { id: 'highlight', label: '🖍 Highlight', icon: '🖍' },
-  { id: 'draw', label: '✏️ Draw', icon: '✏️' },
-  { id: 'text', label: '📝 Note', icon: '📝' },
+  { id: 'view', label: '👆 Select' },
+  { id: 'highlight', label: '🖍 Highlight' },
+  { id: 'draw', label: '✏️ Draw' },
+  { id: 'text', label: '📝 Note' },
 ];
 
 const COLORS = [
@@ -34,23 +41,394 @@ const COLORS = [
   { name: 'Purple', value: '#9C27B0' },
 ];
 
+const DEFAULT_COLOR = COLORS[0].value;
+const HIGHLIGHT_ALPHA_HEX = '66';
+const ANNOTATION_STORAGE_DIR = `${Paths.document.uri}annotation-state/`;
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function normalizeAnnotationState(rawAnnotations) {
+  if (!rawAnnotations || typeof rawAnnotations !== 'object') {
+    return {};
+  }
+
+  return Object.entries(rawAnnotations).reduce((pages, [pageKey, pageAnnotations]) => {
+    if (!pageAnnotations || typeof pageAnnotations !== 'object') {
+      return pages;
+    }
+
+    pages[pageKey] = {
+      highlights: Array.isArray(pageAnnotations.highlights)
+        ? pageAnnotations.highlights
+        : [],
+      drawings: Array.isArray(pageAnnotations.drawings)
+        ? pageAnnotations.drawings
+        : [],
+      notes: Array.isArray(pageAnnotations.notes) ? pageAnnotations.notes : [],
+    };
+
+    return pages;
+  }, {});
+}
+
+function hasAnnotations(annotationState = {}) {
+  return Object.values(annotationState).some((pageAnnotations) => {
+    if (!pageAnnotations || typeof pageAnnotations !== 'object') {
+      return false;
+    }
+
+    return (
+      (pageAnnotations.highlights || []).length > 0 ||
+      (pageAnnotations.drawings || []).length > 0 ||
+      (pageAnnotations.notes || []).length > 0
+    );
+  });
+}
+
+function getAnnotationStorageUri(documentKey) {
+  return `${ANNOTATION_STORAGE_DIR}${documentKey}.json`;
+}
+
+function sanitizeFileSegment(value = 'document') {
+  return (
+    value
+      .replace(/\.pdf$/i, '')
+      .replace(/[^a-z0-9-_]+/gi, '_')
+      .replace(/^_+|_+$/g, '') || 'document'
+  );
+}
+
+function buildAnnotatedFileName(documentName) {
+  const timestamp = new Date()
+    .toISOString()
+    .replace(/[^0-9]/g, '')
+    .slice(0, 14);
+  return `${sanitizeFileSegment(documentName)}_annotated_${timestamp}.pdf`;
+}
+
+function parseHexColor(hexColor, fallbackOpacity = 1) {
+  if (typeof hexColor !== 'string' || !hexColor.startsWith('#')) {
+    return { color: rgb(1, 0, 0), opacity: fallbackOpacity };
+  }
+
+  let normalized = hexColor.slice(1);
+  if (normalized.length === 3 || normalized.length === 4) {
+    normalized = normalized
+      .split('')
+      .map((character) => character + character)
+      .join('');
+  }
+
+  let opacity = fallbackOpacity;
+  if (normalized.length === 8) {
+    opacity = parseInt(normalized.slice(6, 8), 16) / 255;
+    normalized = normalized.slice(0, 6);
+  }
+
+  if (normalized.length !== 6) {
+    return { color: rgb(1, 0, 0), opacity: fallbackOpacity };
+  }
+
+  const red = parseInt(normalized.slice(0, 2), 16);
+  const green = parseInt(normalized.slice(2, 4), 16);
+  const blue = parseInt(normalized.slice(4, 6), 16);
+
+  if ([red, green, blue].some((channel) => Number.isNaN(channel))) {
+    return { color: rgb(1, 0, 0), opacity: fallbackOpacity };
+  }
+
+  return {
+    color: rgb(red / 255, green / 255, blue / 255),
+    opacity,
+  };
+}
+
+function normalizePdfPoint(point, pageWidth, pageHeight) {
+  return {
+    x: clamp(Number(point?.x) || 0, 0, 1) * pageWidth,
+    y: pageHeight - clamp(Number(point?.y) || 0, 0, 1) * pageHeight,
+  };
+}
+
+function wrapNoteText(text, font, fontSize, maxWidth) {
+  const paragraphs = String(text || '').split(/\r?\n/);
+  const lines = [];
+
+  const pushWrappedWord = (word) => {
+    let fragment = '';
+    for (const character of word) {
+      const candidate = fragment + character;
+      if (font.widthOfTextAtSize(candidate, fontSize) <= maxWidth) {
+        fragment = candidate;
+      } else {
+        if (fragment) {
+          lines.push(fragment);
+        }
+        fragment = character;
+      }
+    }
+
+    if (fragment) {
+      lines.push(fragment);
+    }
+  };
+
+  paragraphs.forEach((paragraph) => {
+    const words = paragraph.trim().split(/\s+/).filter(Boolean);
+
+    if (!words.length) {
+      lines.push('');
+      return;
+    }
+
+    let currentLine = '';
+
+    for (const word of words) {
+      if (!currentLine) {
+        if (font.widthOfTextAtSize(word, fontSize) > maxWidth) {
+          pushWrappedWord(word);
+          continue;
+        }
+
+        currentLine = word;
+        continue;
+      }
+
+      const nextLine = `${currentLine} ${word}`;
+
+      if (font.widthOfTextAtSize(nextLine, fontSize) <= maxWidth) {
+        currentLine = nextLine;
+        continue;
+      }
+
+      if (font.widthOfTextAtSize(word, fontSize) > maxWidth) {
+        lines.push(currentLine);
+        currentLine = '';
+        pushWrappedWord(word);
+      } else {
+        lines.push(currentLine);
+        currentLine = word;
+      }
+    }
+
+    if (currentLine) {
+      lines.push(currentLine);
+    }
+  });
+
+  return lines.length ? lines : [''];
+}
+
+function getSelectedAnnotationDescription(selectedAnnotation) {
+  if (!selectedAnnotation) {
+    return 'Tap any highlight, drawing, or note to select it.';
+  }
+
+  const label =
+    selectedAnnotation.type === 'highlight'
+      ? 'highlight'
+      : selectedAnnotation.type === 'drawing'
+        ? 'drawing'
+        : 'note';
+
+  return `Selected ${label} on page ${selectedAnnotation.page}.`;
+}
+
+async function savePdfToAndroidDeviceFolder(base64Contents, fileName) {
+  if (
+    Platform.OS !== 'android' ||
+    !LegacyFileSystem.StorageAccessFramework
+  ) {
+    return { savedToDevice: false, reason: 'unsupported_platform' };
+  }
+
+  try {
+    const downloadsRootUri =
+      LegacyFileSystem.StorageAccessFramework.getUriForDirectoryInRoot('Download');
+    const permission =
+      await LegacyFileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync(
+        downloadsRootUri
+      );
+
+    if (!permission.granted) {
+      return { savedToDevice: false, reason: 'permission_denied' };
+    }
+
+    const targetUri = await LegacyFileSystem.StorageAccessFramework.createFileAsync(
+      permission.directoryUri,
+      fileName,
+      'application/pdf'
+    );
+
+    await LegacyFileSystem.StorageAccessFramework.writeAsStringAsync(
+      targetUri,
+      base64Contents,
+      {
+        encoding: LegacyFileSystem.EncodingType.Base64,
+      }
+    );
+
+    return {
+      savedToDevice: true,
+      directoryUri: permission.directoryUri,
+      targetUri,
+    };
+  } catch (error) {
+    return {
+      savedToDevice: false,
+      reason: 'write_failed',
+      error,
+    };
+  }
+}
+
 export default function App() {
   const [documentUri, setDocumentUri] = useState(null);
   const [documentName, setDocumentName] = useState('');
   const [documentType, setDocumentType] = useState('');
+  const [documentKey, setDocumentKey] = useState(null);
   const [base64Data, setBase64Data] = useState(null);
+  const [viewerHtml, setViewerHtml] = useState(null);
+  const [annotationState, setAnnotationState] = useState({});
+  const [selectedAnnotation, setSelectedAnnotation] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [savingAnnotatedPdf, setSavingAnnotatedPdf] = useState(false);
   const [activeTool, setActiveTool] = useState('view');
-  const [activeColor, setActiveColor] = useState('#FF0000');
+  const [activeColor, setActiveColor] = useState(DEFAULT_COLOR);
   const [showColorPicker, setShowColorPicker] = useState(false);
+  const [showToolbar, setShowToolbar] = useState(true);
   const [totalPages, setTotalPages] = useState(0);
   const [textNoteModal, setTextNoteModal] = useState(null);
   const [noteText, setNoteText] = useState('');
-  const [showToolbar, setShowToolbar] = useState(true);
 
   const webViewRef = useRef(null);
+  const annotationWriteQueueRef = useRef(Promise.resolve());
+  const annotationDirectoryReadyRef = useRef(false);
 
-  // Pick a document from the device
+  const ensureAnnotationStorageDirectory = useCallback(async () => {
+    if (annotationDirectoryReadyRef.current) {
+      return;
+    }
+
+    try {
+      await LegacyFileSystem.makeDirectoryAsync(ANNOTATION_STORAGE_DIR, {
+        intermediates: true,
+      });
+    } catch (error) {
+      if (!String(error?.message || '').toLowerCase().includes('exists')) {
+        throw error;
+      }
+    }
+
+    annotationDirectoryReadyRef.current = true;
+  }, []);
+
+  const persistAnnotationState = useCallback(
+    (nextDocumentKey, nextAnnotations) => {
+      if (!nextDocumentKey) {
+        return;
+      }
+
+      const normalizedAnnotations = normalizeAnnotationState(nextAnnotations);
+
+      annotationWriteQueueRef.current = annotationWriteQueueRef.current
+        .then(async () => {
+          await ensureAnnotationStorageDirectory();
+          const annotationUri = getAnnotationStorageUri(nextDocumentKey);
+
+          if (!hasAnnotations(normalizedAnnotations)) {
+            const info = await LegacyFileSystem.getInfoAsync(annotationUri);
+            if (info.exists) {
+              await LegacyFileSystem.deleteAsync(annotationUri);
+            }
+            return;
+          }
+
+          await LegacyFileSystem.writeAsStringAsync(
+            annotationUri,
+            JSON.stringify({
+              version: 1,
+              annotations: normalizedAnnotations,
+            })
+          );
+        })
+        .catch((error) => {
+          Alert.alert(
+            'Annotation Save Error',
+            'Failed to save annotations: ' + error.message
+          );
+        });
+    },
+    [ensureAnnotationStorageDirectory]
+  );
+
+  const loadPersistedAnnotations = useCallback(
+    async (nextDocumentKey) => {
+      if (!nextDocumentKey) {
+        return {};
+      }
+
+      await ensureAnnotationStorageDirectory();
+      const annotationUri = getAnnotationStorageUri(nextDocumentKey);
+      const info = await LegacyFileSystem.getInfoAsync(annotationUri);
+
+      if (!info.exists) {
+        return {};
+      }
+
+      const rawContents = await LegacyFileSystem.readAsStringAsync(annotationUri);
+      const parsed = JSON.parse(rawContents);
+      return normalizeAnnotationState(parsed.annotations || parsed);
+    },
+    [ensureAnnotationStorageDirectory]
+  );
+
+  const sendCommand = useCallback((command) => {
+    if (!webViewRef.current) {
+      return;
+    }
+
+    const js = `
+      (function() {
+        try {
+          var message = ${JSON.stringify(JSON.stringify(command))};
+          var parsed = JSON.parse(message);
+          switch (parsed.command) {
+            case 'setMode':
+              typeof setMode === 'function' && setMode(parsed.mode);
+              break;
+            case 'setDrawColor':
+              typeof setDrawColor === 'function' && setDrawColor(parsed.color);
+              break;
+            case 'setHighlightColor':
+              typeof setHighlightColor === 'function' && setHighlightColor(parsed.color);
+              break;
+            case 'addTextNote':
+              typeof addTextNote === 'function' &&
+                addTextNote(parsed.page, parsed.x, parsed.y, parsed.text);
+              break;
+            case 'clearPage':
+              typeof clearAnnotations === 'function' && clearAnnotations(parsed.page);
+              break;
+            case 'clearAll':
+              typeof clearAllAnnotations === 'function' && clearAllAnnotations();
+              break;
+            case 'deleteSelected':
+              typeof deleteSelectedAnnotation === 'function' && deleteSelectedAnnotation();
+              break;
+          }
+        } catch (error) {
+          console.error('Command error:', error);
+        }
+      })();
+      true;
+    `;
+
+    webViewRef.current.injectJavaScript(js);
+  }, []);
+
   const pickDocument = useCallback(async () => {
     try {
       const result = await DocumentPicker.getDocumentAsync({
@@ -68,59 +446,87 @@ export default function App() {
         copyToCacheDirectory: true,
       });
 
-      if (result.canceled) return;
-
-      const file = result.assets[0];
-      setLoading(true);
-      setDocumentName(file.name);
-      setDocumentUri(file.uri);
-
-      // Determine document type
-      const ext = file.name.split('.').pop().toLowerCase();
-      setDocumentType(ext);
-
-      if (ext === 'pdf') {
-        // Read the PDF as base64 for WebView rendering
-        const base64 = await LegacyFileSystem.readAsStringAsync(file.uri, {
-          encoding: LegacyFileSystem.EncodingType.Base64,
-        });
-        setBase64Data(base64);
-      } else {
-        // For non-PDF files, we'll still load them
-        setBase64Data(null);
+      if (result.canceled) {
+        return;
       }
 
-      setLoading(false);
-    } catch (err) {
-      setLoading(false);
-      Alert.alert('Error', 'Failed to pick document: ' + err.message);
-    }
-  }, []);
+      const file = result.assets[0];
+      const extension = file.name.split('.').pop().toLowerCase();
 
-  // Make a copy of the document
+      setLoading(true);
+      setDocumentUri(file.uri);
+      setDocumentName(file.name);
+      setDocumentType(extension);
+      setTotalPages(0);
+      setTextNoteModal(null);
+      setNoteText('');
+      setActiveTool('view');
+      setActiveColor(DEFAULT_COLOR);
+      setShowColorPicker(false);
+      setShowToolbar(true);
+      setSelectedAnnotation(null);
+      setAnnotationState({});
+      setBase64Data(null);
+      setViewerHtml(null);
+
+      if (extension === 'pdf') {
+        const fileInfo = await LegacyFileSystem.getInfoAsync(file.uri, { md5: true });
+        const nextDocumentKey =
+          fileInfo.md5 || `${file.name}-${fileInfo.size || Date.now()}`;
+        const [base64, persistedAnnotations] = await Promise.all([
+          LegacyFileSystem.readAsStringAsync(file.uri, {
+            encoding: LegacyFileSystem.EncodingType.Base64,
+          }),
+          loadPersistedAnnotations(nextDocumentKey),
+        ]);
+
+        setDocumentKey(nextDocumentKey);
+        setBase64Data(base64);
+        setAnnotationState(persistedAnnotations);
+        setViewerHtml(
+          getPdfViewerHtml(base64, {
+            initialAnnotations: persistedAnnotations,
+            initialMode: 'view',
+            initialDrawColor: DEFAULT_COLOR,
+            initialHighlightColor: DEFAULT_COLOR + HIGHLIGHT_ALPHA_HEX,
+          })
+        );
+      } else {
+        setDocumentKey(null);
+      }
+    } catch (error) {
+      Alert.alert('Error', 'Failed to pick document: ' + error.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [loadPersistedAnnotations]);
+
   const copyDocument = useCallback(async () => {
-    if (!documentUri) return;
+    if (!documentUri) {
+      return;
+    }
 
     try {
-      const ext = documentName.split('.').pop();
-      const baseName = documentName.replace('.' + ext, '');
-      const newName = baseName + '_copy.' + ext;
-      const newUri = Paths.document.uri + newName;
+      const extension = documentName.split('.').pop();
+      const baseName = documentName.replace('.' + extension, '');
+      const newName = `${baseName}_copy.${extension}`;
+      const nextUri = Paths.document.uri + newName;
 
       await LegacyFileSystem.copyAsync({
         from: documentUri,
-        to: newUri,
+        to: nextUri,
       });
 
       Alert.alert('Success', 'Document copied as: ' + newName);
-    } catch (err) {
-      Alert.alert('Error', 'Failed to copy: ' + err.message);
+    } catch (error) {
+      Alert.alert('Error', 'Failed to copy: ' + error.message);
     }
-  }, [documentUri, documentName]);
+  }, [documentName, documentUri]);
 
-  // Share / export the document
   const shareDocument = useCallback(async () => {
-    if (!documentUri) return;
+    if (!documentUri) {
+      return;
+    }
 
     try {
       const isAvailable = await Sharing.isAvailableAsync();
@@ -128,94 +534,299 @@ export default function App() {
         Alert.alert('Error', 'Sharing is not available on this device');
         return;
       }
+
       await Sharing.shareAsync(documentUri);
-    } catch (err) {
-      Alert.alert('Error', 'Failed to share: ' + err.message);
+    } catch (error) {
+      Alert.alert('Error', 'Failed to share: ' + error.message);
     }
   }, [documentUri]);
 
-  // Send a command to the WebView via injectJavaScript
-  const sendCommand = useCallback((command) => {
-    if (webViewRef.current) {
-      const js = `
-        (function() {
-          try {
-            var msg = ${JSON.stringify(JSON.stringify(command))};
-            var parsed = JSON.parse(msg);
-            switch(parsed.command) {
-              case 'setMode': setMode(parsed.mode); break;
-              case 'setDrawColor': setDrawColor(parsed.color); break;
-              case 'setHighlightColor': setHighlightColor(parsed.color); break;
-              case 'addTextNote': addTextNote(parsed.page, parsed.x, parsed.y, parsed.text); break;
-              case 'clearPage': clearAnnotations(parsed.page); break;
-              case 'clearAll': clearAllAnnotations(); break;
-            }
-          } catch(e) { console.error('Command error:', e); }
-        })();
-        true;
-      `;
-      webViewRef.current.injectJavaScript(js);
-    }
-  }, []);
+  const selectTool = useCallback(
+    (toolId) => {
+      setActiveTool(toolId);
+      setSelectedAnnotation(null);
+      setShowColorPicker(toolId === 'draw' || toolId === 'highlight');
+      sendCommand({ command: 'setMode', mode: toolId });
+    },
+    [sendCommand]
+  );
 
-  // Handle tool selection
-  const selectTool = useCallback((toolId) => {
-    setActiveTool(toolId);
-    sendCommand({ command: 'setMode', mode: toolId });
-    if (toolId === 'draw' || toolId === 'highlight') {
-      setShowColorPicker(true);
-    } else {
-      setShowColorPicker(false);
-    }
-  }, [sendCommand]);
-
-  // Handle color selection
-  const selectColor = useCallback((color) => {
-    setActiveColor(color);
-    if (activeTool === 'draw') {
-      sendCommand({ command: 'setDrawColor', color });
-    } else if (activeTool === 'highlight') {
-      const alpha = '66'; // ~40% opacity
-      sendCommand({ command: 'setHighlightColor', color: color + alpha });
-    }
-  }, [activeTool, sendCommand]);
-
-  // Clear all annotations
-  const clearAll = useCallback(() => {
-    Alert.alert(
-      'Clear Annotations',
-      'Remove all highlights, drawings, and notes?',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Clear All',
-          style: 'destructive',
-          onPress: () => sendCommand({ command: 'clearAll' }),
-        },
-      ]
-    );
-  }, [sendCommand]);
-
-  // Handle messages from WebView
-  const handleWebViewMessage = useCallback((event) => {
-    try {
-      const data = JSON.parse(event.nativeEvent.data);
-      switch (data.type) {
-        case 'pdfLoaded':
-          setTotalPages(data.totalPages);
-          break;
-        case 'requestTextInput':
-          setTextNoteModal({ page: data.page, x: data.x, y: data.y });
-          setNoteText('');
-          break;
-        case 'error':
-          Alert.alert('PDF Error', data.message);
-          break;
+  const selectColor = useCallback(
+    (color) => {
+      setActiveColor(color);
+      if (activeTool === 'draw') {
+        sendCommand({ command: 'setDrawColor', color });
+      } else if (activeTool === 'highlight') {
+        sendCommand({
+          command: 'setHighlightColor',
+          color: color + HIGHLIGHT_ALPHA_HEX,
+        });
       }
-    } catch (_) {}
-  }, []);
+    },
+    [activeTool, sendCommand]
+  );
 
-  // Submit text note
+  const deleteSelectedAnnotation = useCallback(() => {
+    if (!selectedAnnotation) {
+      return;
+    }
+
+    sendCommand({ command: 'deleteSelected' });
+  }, [selectedAnnotation, sendCommand]);
+
+  const clearAll = useCallback(() => {
+    Alert.alert('Clear Annotations', 'Remove all highlights, drawings, and notes?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Clear All',
+        style: 'destructive',
+        onPress: () => sendCommand({ command: 'clearAll' }),
+      },
+    ]);
+  }, [sendCommand]);
+
+  const saveAnnotatedPdf = useCallback(async () => {
+    if (!base64Data || documentType !== 'pdf') {
+      return;
+    }
+
+    try {
+      setSavingAnnotatedPdf(true);
+
+      const pdfDocument = await PDFDocument.load(base64Data);
+      const noteFont = await pdfDocument.embedFont(StandardFonts.Helvetica);
+      const pages = pdfDocument.getPages();
+
+      Object.entries(annotationState).forEach(([pageKey, pageAnnotations]) => {
+        const page = pages[Number(pageKey) - 1];
+        if (!page) {
+          return;
+        }
+
+        const { width, height } = page.getSize();
+
+        (pageAnnotations.highlights || []).forEach((highlight) => {
+          const highlightWidth = clamp(Number(highlight.width) || 0, 0, 1) * width;
+          const highlightHeight = clamp(Number(highlight.height) || 0, 0, 1) * height;
+
+          if (highlightWidth < 1 || highlightHeight < 1) {
+            return;
+          }
+
+          const { color, opacity } = parseHexColor(highlight.color, 0.4);
+          const x = clamp(Number(highlight.x) || 0, 0, 1) * width;
+          const y =
+            height -
+            (clamp(Number(highlight.y) || 0, 0, 1) + clamp(Number(highlight.height) || 0, 0, 1)) *
+              height;
+
+          page.drawRectangle({
+            x,
+            y,
+            width: highlightWidth,
+            height: highlightHeight,
+            color,
+            opacity,
+            blendMode: BlendMode.Multiply,
+          });
+        });
+
+        (pageAnnotations.drawings || []).forEach((drawing) => {
+          const pdfPoints = (drawing.points || []).map((point) =>
+            normalizePdfPoint(point, width, height)
+          );
+
+          if (!pdfPoints.length) {
+            return;
+          }
+
+          const { color, opacity } = parseHexColor(drawing.color, 1);
+          const thickness = Math.max(
+            clamp(Number(drawing.width) || 0.006, 0.001, 0.05) * width,
+            1.2
+          );
+
+          if (pdfPoints.length === 1) {
+            page.drawCircle({
+              x: pdfPoints[0].x,
+              y: pdfPoints[0].y,
+              size: Math.max(thickness / 2, 0.8),
+              color,
+              opacity,
+            });
+            return;
+          }
+
+          for (let index = 0; index < pdfPoints.length - 1; index += 1) {
+            page.drawLine({
+              start: pdfPoints[index],
+              end: pdfPoints[index + 1],
+              thickness,
+              color,
+              opacity,
+              lineCap: LineCapStyle.Round,
+            });
+          }
+        });
+
+        (pageAnnotations.notes || []).forEach((note) => {
+          const fontSize = 12;
+          const lineHeight = fontSize * 1.25;
+          const maxTextWidth = Math.min(width * 0.35, 180);
+          const lines = wrapNoteText(note.text, noteFont, fontSize, maxTextWidth);
+          const textWidth = lines.reduce((currentWidth, line) => {
+            const measuredWidth = noteFont.widthOfTextAtSize(line || ' ', fontSize);
+            return Math.max(currentWidth, measuredWidth);
+          }, 40);
+
+          const noteWidth = Math.min(textWidth + 14, width * 0.42);
+          const noteHeight = Math.max(lines.length * lineHeight + 14, 28);
+          const x = clamp(
+            (Number(note.x) || 0) * width,
+            8,
+            Math.max(width - noteWidth - 8, 8)
+          );
+          const y = clamp(
+            height - (clamp(Number(note.y) || 0, 0, 1) * height) - noteHeight,
+            8,
+            Math.max(height - noteHeight - 8, 8)
+          );
+
+          page.drawRectangle({
+            x,
+            y,
+            width: noteWidth,
+            height: noteHeight,
+            color: rgb(1, 0.976, 0.769),
+            borderWidth: 1,
+            borderColor: rgb(0.976, 0.659, 0.145),
+            opacity: 0.98,
+          });
+
+          lines.forEach((line, index) => {
+            page.drawText(line, {
+              x: x + 7,
+              y: y + noteHeight - 9 - fontSize - index * lineHeight,
+              size: fontSize,
+              font: noteFont,
+              color: rgb(0.2, 0.2, 0.2),
+            });
+          });
+        });
+      });
+
+      const bakedPdfBase64 = await pdfDocument.saveAsBase64();
+      const fileName = buildAnnotatedFileName(documentName);
+      const outputUri = `${Paths.document.uri}${fileName}`;
+
+      await LegacyFileSystem.writeAsStringAsync(outputUri, bakedPdfBase64, {
+        encoding: LegacyFileSystem.EncodingType.Base64,
+      });
+
+      const deviceSaveResult =
+        Platform.OS === 'android'
+          ? await savePdfToAndroidDeviceFolder(bakedPdfBase64, fileName)
+          : { savedToDevice: false, reason: 'unsupported_platform' };
+
+      const canShare = await Sharing.isAvailableAsync();
+      const saveSummary = [`Saved in app storage as ${fileName}.`];
+
+      if (deviceSaveResult.savedToDevice) {
+        saveSummary.push(
+          'A second copy was also saved to the folder you picked on your phone.'
+        );
+      } else if (Platform.OS === 'android') {
+        saveSummary.push(
+          'The visible device copy was not created. Next time, allow the folder picker to save directly into phone storage.'
+        );
+      }
+
+      Alert.alert('Annotated PDF Saved', saveSummary.join(' '), [
+        ...(canShare
+          ? [
+              {
+                text: 'Share',
+                onPress: () => Sharing.shareAsync(outputUri),
+              },
+            ]
+          : []),
+        { text: 'OK' },
+      ]);
+    } catch (error) {
+      Alert.alert(
+        'Save Failed',
+        'Could not save the annotated PDF: ' + error.message
+      );
+    } finally {
+      setSavingAnnotatedPdf(false);
+    }
+  }, [annotationState, base64Data, documentName, documentType]);
+
+  const handleWebViewMessage = useCallback(
+    (event) => {
+      try {
+        const data = JSON.parse(event.nativeEvent.data);
+
+        switch (data.type) {
+          case 'pdfLoaded':
+            setTotalPages(data.totalPages);
+            sendCommand({ command: 'setMode', mode: activeTool });
+            sendCommand({ command: 'setDrawColor', color: activeColor });
+            sendCommand({
+              command: 'setHighlightColor',
+              color: activeColor + HIGHLIGHT_ALPHA_HEX,
+            });
+            break;
+          case 'requestTextInput':
+            setTextNoteModal({ page: data.page, x: data.x, y: data.y });
+            setNoteText('');
+            break;
+          case 'annotationSelected':
+            setSelectedAnnotation(data.annotation || null);
+            break;
+          case 'annotationsChanged': {
+            const nextAnnotations = normalizeAnnotationState(data.annotations);
+            setAnnotationState(nextAnnotations);
+            persistAnnotationState(documentKey, nextAnnotations);
+            setSelectedAnnotation((currentSelection) => {
+              if (!currentSelection) {
+                return currentSelection;
+              }
+
+              const pageAnnotations = nextAnnotations[currentSelection.page];
+              if (!pageAnnotations) {
+                return null;
+              }
+
+              const bucket =
+                currentSelection.type === 'highlight'
+                  ? pageAnnotations.highlights
+                  : currentSelection.type === 'drawing'
+                    ? pageAnnotations.drawings
+                    : pageAnnotations.notes;
+
+              return bucket.some(
+                (annotation) => annotation.id === currentSelection.id
+              )
+                ? currentSelection
+                : null;
+            });
+            break;
+          }
+          case 'modeChanged':
+            if (data.mode !== 'view') {
+              setSelectedAnnotation(null);
+            }
+            break;
+          case 'error':
+            Alert.alert('PDF Error', data.message);
+            break;
+        }
+      } catch (_) {}
+    },
+    [activeColor, activeTool, documentKey, persistAnnotationState, sendCommand]
+  );
+
   const submitTextNote = useCallback(() => {
     if (textNoteModal && noteText.trim()) {
       sendCommand({
@@ -226,21 +837,23 @@ export default function App() {
         text: noteText.trim(),
       });
     }
+
     setTextNoteModal(null);
     setNoteText('');
-  }, [textNoteModal, noteText, sendCommand]);
+  }, [noteText, sendCommand, textNoteModal]);
 
-  // Render the non-PDF document viewer (for txt, images, etc.)
   const renderNonPdfViewer = () => {
-    const ext = documentType;
-    if (['txt'].includes(ext)) {
+    const extension = documentType;
+
+    if (['txt'].includes(extension)) {
       return (
         <View style={styles.nonPdfContainer}>
           <TextFileViewer uri={documentUri} />
         </View>
       );
     }
-    if (['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'].includes(ext)) {
+
+    if (['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'].includes(extension)) {
       return (
         <View style={styles.nonPdfContainer}>
           <WebView
@@ -251,18 +864,19 @@ export default function App() {
         </View>
       );
     }
-    // For Office docs, read as base64 and use Google Docs Viewer via data approach
-    if (['doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx'].includes(ext)) {
+
+    if (['doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx'].includes(extension)) {
       return (
         <View style={styles.nonPdfContainer}>
           <OfficeDocViewer uri={documentUri} name={documentName} />
         </View>
       );
     }
+
     return (
       <View style={styles.unsupported}>
         <Text style={styles.unsupportedText}>
-          Preview not available for .{ext} files.
+          Preview not available for .{extension} files.
         </Text>
         <Text style={styles.unsupportedHint}>
           You can still copy or share this document using the buttons above.
@@ -271,22 +885,17 @@ export default function App() {
     );
   };
 
-  // ---- Main Render ----
   return (
     <View style={styles.container}>
       <StatusBar style="light" />
 
-      {/* Header */}
       <View style={styles.header}>
         <Text style={styles.headerTitle} numberOfLines={1}>
           {documentName || 'Document Viewer'}
         </Text>
-        {totalPages > 0 && (
-          <Text style={styles.pageCount}>{totalPages} pages</Text>
-        )}
+        {totalPages > 0 && <Text style={styles.pageCount}>{totalPages} pages</Text>}
       </View>
 
-      {/* No document loaded - landing screen */}
       {!documentUri && !loading && (
         <View style={styles.landing}>
           <Text style={styles.landingIcon}>📄</Text>
@@ -304,7 +913,6 @@ export default function App() {
         </View>
       )}
 
-      {/* Loading */}
       {loading && (
         <View style={styles.landing}>
           <ActivityIndicator size="large" color="#6200ee" />
@@ -312,10 +920,8 @@ export default function App() {
         </View>
       )}
 
-      {/* Document loaded */}
       {documentUri && !loading && (
         <View style={styles.documentArea}>
-          {/* Action bar */}
           <View style={styles.actionBar}>
             <ScrollView horizontal showsHorizontalScrollIndicator={false}>
               <TouchableOpacity style={styles.actionBtn} onPress={pickDocument}>
@@ -330,22 +936,53 @@ export default function App() {
               {documentType === 'pdf' && (
                 <>
                   <TouchableOpacity
+                    style={[
+                      styles.actionBtnPrimary,
+                      savingAnnotatedPdf && styles.actionBtnDisabled,
+                    ]}
+                    disabled={savingAnnotatedPdf}
+                    onPress={saveAnnotatedPdf}
+                  >
+                    <Text style={styles.actionBtnPrimaryText}>
+                      {savingAnnotatedPdf ? '⏳ Saving PDF...' : '💾 Save Annotated PDF'}
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[
+                      styles.actionBtnDanger,
+                      !selectedAnnotation && styles.actionBtnDisabled,
+                    ]}
+                    disabled={!selectedAnnotation}
+                    onPress={deleteSelectedAnnotation}
+                  >
+                    <Text style={styles.actionBtnDangerText}>🗑 Delete Selected</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
                     style={styles.actionBtn}
-                    onPress={() => setShowToolbar(!showToolbar)}
+                    onPress={() => setShowToolbar((currentValue) => !currentValue)}
                   >
                     <Text style={styles.actionBtnText}>
                       {showToolbar ? '🔧 Hide Tools' : '🔧 Show Tools'}
                     </Text>
                   </TouchableOpacity>
                   <TouchableOpacity style={styles.actionBtnDanger} onPress={clearAll}>
-                    <Text style={styles.actionBtnDangerText}>🗑 Clear All</Text>
+                    <Text style={styles.actionBtnDangerText}>🧹 Clear All</Text>
                   </TouchableOpacity>
                 </>
               )}
             </ScrollView>
           </View>
 
-          {/* Annotation toolbar (PDF only) */}
+          {documentType === 'pdf' && (
+            <View style={styles.selectionBar}>
+              <Text style={styles.selectionText}>
+                {activeTool === 'view'
+                  ? getSelectedAnnotationDescription(selectedAnnotation)
+                  : 'Switch to Select mode to tap an annotation before deleting it.'}
+              </Text>
+            </View>
+          )}
+
           {documentType === 'pdf' && showToolbar && (
             <View style={styles.toolbar}>
               <View style={styles.toolRow}>
@@ -369,6 +1006,7 @@ export default function App() {
                   </TouchableOpacity>
                 ))}
               </View>
+
               {showColorPicker && (
                 <View style={styles.colorRow}>
                   {COLORS.map((color) => (
@@ -387,11 +1025,11 @@ export default function App() {
             </View>
           )}
 
-          {/* PDF Viewer */}
-          {documentType === 'pdf' && base64Data ? (
+          {documentType === 'pdf' && viewerHtml ? (
             <WebView
+              key={documentKey || documentUri}
               ref={webViewRef}
-              source={{ html: getPdfViewerHtml(base64Data) }}
+              source={{ html: viewerHtml }}
               style={styles.webView}
               originWhitelist={['*']}
               javaScriptEnabled={true}
@@ -416,7 +1054,6 @@ export default function App() {
         </View>
       )}
 
-      {/* Text note input modal */}
       <Modal
         visible={textNoteModal !== null}
         transparent={true}
@@ -442,10 +1079,7 @@ export default function App() {
               >
                 <Text style={styles.modalBtnCancelText}>Cancel</Text>
               </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.modalBtnSubmit}
-                onPress={submitTextNote}
-              >
+              <TouchableOpacity style={styles.modalBtnSubmit} onPress={submitTextNote}>
                 <Text style={styles.modalBtnSubmitText}>Add Note</Text>
               </TouchableOpacity>
             </View>
@@ -456,7 +1090,6 @@ export default function App() {
   );
 }
 
-// Simple text file viewer component
 function TextFileViewer({ uri }) {
   const [content, setContent] = useState('');
   const [loadingText, setLoadingText] = useState(true);
@@ -467,8 +1100,8 @@ function TextFileViewer({ uri }) {
         const file = new File(uri);
         const text = await file.text();
         setContent(text);
-      } catch (err) {
-        setContent('Error reading file: ' + err.message);
+      } catch (error) {
+        setContent('Error reading file: ' + error.message);
       }
       setLoadingText(false);
     })();
@@ -487,18 +1120,15 @@ function TextFileViewer({ uri }) {
   );
 }
 
-// Office document viewer using Microsoft Office Online viewer
 function OfficeDocViewer({ uri, name }) {
-  const [viewerUrl, setViewerUrl] = useState(null);
   const [error, setError] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
 
   React.useEffect(() => {
     (async () => {
       try {
-        // Copy the file to a temporary location with proper name
-        const ext = name.split('.').pop().toLowerCase();
-        const tempName = 'office_preview_' + Date.now() + '.' + ext;
+        const extension = name.split('.').pop().toLowerCase();
+        const tempName = 'office_preview_' + Date.now() + '.' + extension;
         const tempUri = Paths.cache.uri + tempName;
 
         await LegacyFileSystem.copyAsync({
@@ -506,25 +1136,13 @@ function OfficeDocViewer({ uri, name }) {
           to: tempUri,
         });
 
-        // For Office docs, we render them using a basic HTML representation
-        // since we can't use Google Docs Viewer with local files
-        const mimeTypes = {
-          doc: 'application/msword',
-          docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-          ppt: 'application/vnd.ms-powerpoint',
-          pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-          xls: 'application/vnd.ms-excel',
-          xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        };
-
-        setViewerUrl(tempUri);
         setIsLoading(false);
-      } catch (err) {
-        setError('Could not load document: ' + err.message);
+      } catch (loadError) {
+        setError('Could not load document: ' + loadError.message);
         setIsLoading(false);
       }
     })();
-  }, [uri, name]);
+  }, [name, uri]);
 
   if (isLoading) {
     return (
@@ -543,7 +1161,6 @@ function OfficeDocViewer({ uri, name }) {
     );
   }
 
-  // Use Android intent to open Office docs since WebView can't render them directly
   const officeHtml = `
     <!DOCTYPE html>
     <html>
@@ -565,16 +1182,23 @@ function OfficeDocViewer({ uri, name }) {
         .icon { font-size: 64px; margin-bottom: 16px; }
         h2 { color: #333; margin-bottom: 8px; font-size: 18px; }
         p { color: #666; font-size: 14px; line-height: 1.5; max-width: 300px; }
-        .filename { 
-          color: #6200ee; font-weight: 600; 
-          word-break: break-all; margin: 12px 0;
-          background: #ede7f6; padding: 8px 16px;
-          border-radius: 8px; font-size: 13px;
+        .filename {
+          color: #6200ee;
+          font-weight: 600;
+          word-break: break-all;
+          margin: 12px 0;
+          background: #ede7f6;
+          padding: 8px 16px;
+          border-radius: 8px;
+          font-size: 13px;
         }
         .tip {
-          margin-top: 20px; padding: 12px 16px;
-          background: #e3f2fd; border-radius: 8px;
-          color: #1565c0; font-size: 12px;
+          margin-top: 20px;
+          padding: 12px 16px;
+          background: #e3f2fd;
+          border-radius: 8px;
+          color: #1565c0;
+          font-size: 12px;
         }
       </style>
     </head>
@@ -627,7 +1251,6 @@ const styles = StyleSheet.create({
     fontSize: 13,
     marginLeft: 8,
   },
-  // Landing
   landing: {
     flex: 1,
     justifyContent: 'center',
@@ -680,11 +1303,9 @@ const styles = StyleSheet.create({
     marginTop: 16,
     fontSize: 14,
   },
-  // Document area
   documentArea: {
     flex: 1,
   },
-  // Action bar
   actionBar: {
     backgroundColor: '#16213e',
     paddingVertical: 8,
@@ -699,10 +1320,22 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     marginHorizontal: 4,
   },
+  actionBtnPrimary: {
+    backgroundColor: '#0d6e6e',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+    marginHorizontal: 4,
+  },
   actionBtnText: {
     color: '#e0e0e0',
     fontSize: 13,
     fontWeight: '500',
+  },
+  actionBtnPrimaryText: {
+    color: '#eaffff',
+    fontSize: 13,
+    fontWeight: '600',
   },
   actionBtnDanger: {
     backgroundColor: '#b71c1c',
@@ -716,7 +1349,21 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '500',
   },
-  // Toolbar
+  actionBtnDisabled: {
+    opacity: 0.5,
+  },
+  selectionBar: {
+    backgroundColor: '#10192f',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#0f3460',
+  },
+  selectionText: {
+    color: '#b8c6ea',
+    fontSize: 12,
+    lineHeight: 18,
+  },
   toolbar: {
     backgroundColor: '#1a1a2e',
     paddingVertical: 8,
@@ -762,7 +1409,6 @@ const styles = StyleSheet.create({
     borderColor: '#fff',
     borderWidth: 3,
   },
-  // WebView
   webView: {
     flex: 1,
     backgroundColor: '#525659',
@@ -774,17 +1420,9 @@ const styles = StyleSheet.create({
     marginLeft: -20,
     marginTop: -20,
   },
-  // Non-PDF
   nonPdfContainer: {
     flex: 1,
     backgroundColor: '#fff',
-  },
-  officeNote: {
-    backgroundColor: '#fff3e0',
-    padding: 12,
-    fontSize: 12,
-    color: '#e65100',
-    textAlign: 'center',
   },
   unsupported: {
     flex: 1,
@@ -803,7 +1441,6 @@ const styles = StyleSheet.create({
     fontSize: 13,
     textAlign: 'center',
   },
-  // Text viewer
   textViewerScroll: {
     flex: 1,
     padding: 16,
@@ -814,7 +1451,6 @@ const styles = StyleSheet.create({
     color: '#333',
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
-  // Modal
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.6)',
