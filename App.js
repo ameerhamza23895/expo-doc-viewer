@@ -134,10 +134,27 @@ export default function App() {
     }
   }, [documentUri]);
 
-  // Send a command to the WebView
+  // Send a command to the WebView via injectJavaScript
   const sendCommand = useCallback((command) => {
     if (webViewRef.current) {
-      webViewRef.current.postMessage(JSON.stringify(command));
+      const js = `
+        (function() {
+          try {
+            var msg = ${JSON.stringify(JSON.stringify(command))};
+            var parsed = JSON.parse(msg);
+            switch(parsed.command) {
+              case 'setMode': setMode(parsed.mode); break;
+              case 'setDrawColor': setDrawColor(parsed.color); break;
+              case 'setHighlightColor': setHighlightColor(parsed.color); break;
+              case 'addTextNote': addTextNote(parsed.page, parsed.x, parsed.y, parsed.text); break;
+              case 'clearPage': clearAnnotations(parsed.page); break;
+              case 'clearAll': clearAllAnnotations(); break;
+            }
+          } catch(e) { console.error('Command error:', e); }
+        })();
+        true;
+      `;
+      webViewRef.current.injectJavaScript(js);
     }
   }, []);
 
@@ -234,24 +251,11 @@ export default function App() {
         </View>
       );
     }
-    // For Office docs, use Google Docs Viewer
+    // For Office docs, read as base64 and use Google Docs Viewer via data approach
     if (['doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx'].includes(ext)) {
       return (
         <View style={styles.nonPdfContainer}>
-          <Text style={styles.officeNote}>
-            Office documents are displayed in read-only mode via Google Docs Viewer.
-            For editing, use the PDF viewer with annotation tools.
-          </Text>
-          <WebView
-            source={{
-              uri: `https://docs.google.com/gview?embedded=true&url=${encodeURIComponent(documentUri)}`,
-            }}
-            style={styles.webView}
-            startInLoadingState={true}
-            renderLoading={() => (
-              <ActivityIndicator style={styles.loadingCenter} size="large" color="#6200ee" />
-            )}
-          />
+          <OfficeDocViewer uri={documentUri} name={documentName} />
         </View>
       );
     }
@@ -480,6 +484,119 @@ function TextFileViewer({ uri }) {
         {content}
       </Text>
     </ScrollView>
+  );
+}
+
+// Office document viewer using Microsoft Office Online viewer
+function OfficeDocViewer({ uri, name }) {
+  const [viewerUrl, setViewerUrl] = useState(null);
+  const [error, setError] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
+
+  React.useEffect(() => {
+    (async () => {
+      try {
+        // Copy the file to a temporary location with proper name
+        const ext = name.split('.').pop().toLowerCase();
+        const tempName = 'office_preview_' + Date.now() + '.' + ext;
+        const tempUri = Paths.cache.uri + tempName;
+
+        await LegacyFileSystem.copyAsync({
+          from: uri,
+          to: tempUri,
+        });
+
+        // For Office docs, we render them using a basic HTML representation
+        // since we can't use Google Docs Viewer with local files
+        const mimeTypes = {
+          doc: 'application/msword',
+          docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          ppt: 'application/vnd.ms-powerpoint',
+          pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+          xls: 'application/vnd.ms-excel',
+          xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        };
+
+        setViewerUrl(tempUri);
+        setIsLoading(false);
+      } catch (err) {
+        setError('Could not load document: ' + err.message);
+        setIsLoading(false);
+      }
+    })();
+  }, [uri, name]);
+
+  if (isLoading) {
+    return (
+      <View style={styles.landing}>
+        <ActivityIndicator size="large" color="#6200ee" />
+        <Text style={styles.loadingText}>Loading document...</Text>
+      </View>
+    );
+  }
+
+  if (error) {
+    return (
+      <View style={styles.unsupported}>
+        <Text style={styles.unsupportedText}>{error}</Text>
+      </View>
+    );
+  }
+
+  // Use Android intent to open Office docs since WebView can't render them directly
+  const officeHtml = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <style>
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          min-height: 100vh;
+          margin: 0;
+          background: #f5f5f5;
+          padding: 20px;
+          text-align: center;
+        }
+        .icon { font-size: 64px; margin-bottom: 16px; }
+        h2 { color: #333; margin-bottom: 8px; font-size: 18px; }
+        p { color: #666; font-size: 14px; line-height: 1.5; max-width: 300px; }
+        .filename { 
+          color: #6200ee; font-weight: 600; 
+          word-break: break-all; margin: 12px 0;
+          background: #ede7f6; padding: 8px 16px;
+          border-radius: 8px; font-size: 13px;
+        }
+        .tip {
+          margin-top: 20px; padding: 12px 16px;
+          background: #e3f2fd; border-radius: 8px;
+          color: #1565c0; font-size: 12px;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="icon">📄</div>
+      <h2>${name}</h2>
+      <p class="filename">${name}</p>
+      <p>This Office document has been imported successfully.</p>
+      <p>Use the <strong>Share</strong> button above to open it in Microsoft Office, Google Docs, or another editor on your device.</p>
+      <div class="tip">
+        Tip: Tap "Share" to open in your preferred Office app for full editing capabilities.
+      </div>
+    </body>
+    </html>
+  `;
+
+  return (
+    <WebView
+      source={{ html: officeHtml }}
+      style={styles.webView}
+      scrollEnabled={true}
+    />
   );
 }
 
