@@ -13,7 +13,8 @@ import {
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as DocumentPicker from 'expo-document-picker';
-import * as FileSystem from 'expo-file-system';
+import { File, Paths } from 'expo-file-system';
+import * as LegacyFileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import { WebView } from 'react-native-webview';
 import { getPdfViewerHtml } from './src/utils/pdfViewerHtml';
@@ -80,8 +81,8 @@ export default function App() {
 
       if (ext === 'pdf') {
         // Read the PDF as base64 for WebView rendering
-        const base64 = await FileSystem.readAsStringAsync(file.uri, {
-          encoding: FileSystem.EncodingType.Base64,
+        const base64 = await LegacyFileSystem.readAsStringAsync(file.uri, {
+          encoding: LegacyFileSystem.EncodingType.Base64,
         });
         setBase64Data(base64);
       } else {
@@ -104,9 +105,9 @@ export default function App() {
       const ext = documentName.split('.').pop();
       const baseName = documentName.replace('.' + ext, '');
       const newName = baseName + '_copy.' + ext;
-      const newUri = FileSystem.documentDirectory + newName;
+      const newUri = Paths.document.uri + newName;
 
-      await FileSystem.copyAsync({
+      await LegacyFileSystem.copyAsync({
         from: documentUri,
         to: newUri,
       });
@@ -459,7 +460,8 @@ function TextFileViewer({ uri }) {
   React.useEffect(() => {
     (async () => {
       try {
-        const text = await FileSystem.readAsStringAsync(uri);
+        const file = new File(uri);
+        const text = await file.text();
         setContent(text);
       } catch (err) {
         setContent('Error reading file: ' + err.message);
