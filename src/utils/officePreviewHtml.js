@@ -86,6 +86,39 @@ export function getOfficePreviewHtml(base64Data, options = {}) {
       display: block;
       margin: 12px auto;
     }
+    .docx-body img.office-selected-image,
+    .slide-body img.office-selected-image,
+    .editable-cell img.office-selected-image {
+      outline: 3px solid #0d6e6e;
+      outline-offset: 3px;
+      box-shadow: 0 0 0 5px rgba(13, 110, 110, 0.18);
+    }
+    #image-selection-overlay {
+      position: absolute;
+      border: 2px solid #0d6e6e;
+      border-radius: 6px;
+      box-shadow: 0 0 0 4px rgba(13, 110, 110, 0.18);
+      pointer-events: none;
+      display: none;
+      z-index: 999;
+    }
+    #image-selection-overlay.visible {
+      display: block;
+    }
+    #image-selection-handle {
+      position: absolute;
+      width: 18px;
+      height: 18px;
+      right: -10px;
+      bottom: -10px;
+      border-radius: 999px;
+      background: #0d6e6e;
+      border: 2px solid #ffffff;
+      box-shadow: 0 4px 10px rgba(13, 110, 110, 0.34);
+      cursor: nwse-resize;
+      pointer-events: auto;
+      touch-action: none;
+    }
     .tabs {
       display: flex;
       flex-wrap: wrap;
@@ -164,6 +197,9 @@ export function getOfficePreviewHtml(base64Data, options = {}) {
   <div id="shell">
     <div id="status">Preparing preview...</div>
     <div id="preview-root"></div>
+    <div id="image-selection-overlay">
+      <div id="image-selection-handle"></div>
+    </div>
   </div>
 
   <script>
@@ -172,10 +208,15 @@ export function getOfficePreviewHtml(base64Data, options = {}) {
     const sourceFileName = ${fileName};
     const previewRoot = document.getElementById('preview-root');
     const statusElement = document.getElementById('status');
+    const imageSelectionOverlay = document.getElementById('image-selection-overlay');
+    const imageSelectionHandle = document.getElementById('image-selection-handle');
     let currentSheetIndex = 0;
     let currentPreviewKind = 'unsupported';
     let canConvertToPdf = false;
     let isEditable = false;
+    let lastFocusedEditable = null;
+    let selectedImage = null;
+    let activeImageResize = null;
 
     function sendMessage(payload) {
       if (window.ReactNativeWebView) {
@@ -234,6 +275,9 @@ export function getOfficePreviewHtml(base64Data, options = {}) {
 
     function buildPrintableHtml(title) {
       const printableRoot = previewRoot.cloneNode(true);
+      printableRoot.querySelectorAll('.office-selected-image').forEach((image) => {
+        image.classList.remove('office-selected-image');
+      });
       printableRoot.querySelectorAll('[data-sheet-panel]').forEach((sheetPanel) => {
         sheetPanel.style.display = 'block';
       });
@@ -301,6 +345,327 @@ export function getOfficePreviewHtml(base64Data, options = {}) {
 
     function setHtmlPreview(html) {
       previewRoot.innerHTML = html;
+    }
+
+    function clearSelectedImage() {
+      if (selectedImage) {
+        selectedImage.classList.remove('office-selected-image');
+      }
+      selectedImage = null;
+      imageSelectionOverlay.classList.remove('visible');
+    }
+
+    function updateSelectedImageOverlayPosition() {
+      if (!selectedImage || !selectedImage.isConnected) {
+        clearSelectedImage();
+        return;
+      }
+
+      const bounds = selectedImage.getBoundingClientRect();
+      imageSelectionOverlay.style.left = window.scrollX + bounds.left - 4 + 'px';
+      imageSelectionOverlay.style.top = window.scrollY + bounds.top - 4 + 'px';
+      imageSelectionOverlay.style.width = bounds.width + 8 + 'px';
+      imageSelectionOverlay.style.height = bounds.height + 8 + 'px';
+      imageSelectionOverlay.classList.add('visible');
+    }
+
+    function setSelectedImage(image) {
+      clearSelectedImage();
+      selectedImage = image;
+      selectedImage.classList.add('office-selected-image');
+      rememberEditableTarget(image);
+      updateSelectedImageOverlayPosition();
+    }
+
+    function getEditableTarget(node) {
+      if (!node) {
+        return null;
+      }
+
+      if (node.nodeType === Node.TEXT_NODE) {
+        return getEditableTarget(node.parentElement);
+      }
+
+      if (node instanceof HTMLElement && node.isContentEditable) {
+        return node;
+      }
+
+      if (node instanceof HTMLElement) {
+        return node.closest('[contenteditable="true"]');
+      }
+
+      return null;
+    }
+
+    function rememberEditableTarget(target) {
+      const editableTarget = getEditableTarget(target);
+      if (editableTarget) {
+        lastFocusedEditable = editableTarget;
+      }
+    }
+
+    function focusEditableTarget() {
+      let target = getEditableTarget(document.activeElement);
+
+      if (!target) {
+        target = lastFocusedEditable;
+      }
+
+      if (!target) {
+        target = previewRoot.querySelector('[contenteditable="true"]');
+      }
+
+      if (!target) {
+        return null;
+      }
+
+      target.focus();
+      lastFocusedEditable = target;
+      return target;
+    }
+
+    function execFormattingCommand(commandName, value) {
+      const target = focusEditableTarget();
+      if (!target) {
+        return false;
+      }
+
+      document.execCommand('styleWithCSS', false, true);
+      return document.execCommand(commandName, false, value);
+    }
+
+    function getSelectionRangeWithinPreview() {
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount === 0) {
+        return null;
+      }
+
+      const range = selection.getRangeAt(0);
+      if (!previewRoot.contains(range.commonAncestorContainer)) {
+        return null;
+      }
+
+      return range;
+    }
+
+    function getFontSizeTarget() {
+      const selection = window.getSelection();
+      const anchorNode = selection && selection.anchorNode ? selection.anchorNode : null;
+      const anchorElement =
+        anchorNode && anchorNode.nodeType === Node.TEXT_NODE
+          ? anchorNode.parentElement
+          : anchorNode instanceof HTMLElement
+            ? anchorNode
+            : null;
+
+      if (anchorElement) {
+        const blockTarget = anchorElement.closest(
+          'span, p, div, td, th, li, h1, h2, h3, h4, h5, h6'
+        );
+        if (blockTarget && previewRoot.contains(blockTarget)) {
+          return blockTarget;
+        }
+      }
+
+      return focusEditableTarget();
+    }
+
+    function getElementFontSize(element) {
+      if (!element || !(element instanceof HTMLElement)) {
+        return 16;
+      }
+
+      const parsedValue = parseFloat(window.getComputedStyle(element).fontSize);
+      return Number.isFinite(parsedValue) ? parsedValue : 16;
+    }
+
+    function updateRangeSelection(element) {
+      if (!element) {
+        return;
+      }
+
+      const selection = window.getSelection();
+      if (!selection) {
+        return;
+      }
+
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+
+    function adjustFontSize(delta) {
+      const target = focusEditableTarget();
+      if (!target) {
+        return false;
+      }
+
+      const range = getSelectionRangeWithinPreview();
+      const numericDelta = Number(delta);
+      const safeDelta = Number.isFinite(numericDelta) ? numericDelta : 0;
+
+      if (!safeDelta) {
+        return false;
+      }
+
+      if (range && !range.collapsed) {
+        const workingRange = range.cloneRange();
+        const currentSize = getElementFontSize(
+          workingRange.startContainer.nodeType === Node.TEXT_NODE
+            ? workingRange.startContainer.parentElement
+            : workingRange.startContainer
+        );
+        const nextSize = Math.max(10, Math.min(currentSize + safeDelta, 72));
+        const wrapper = document.createElement('span');
+        wrapper.style.fontSize = nextSize + 'px';
+
+        try {
+          workingRange.surroundContents(wrapper);
+        } catch (_) {
+          const fragment = workingRange.extractContents();
+          wrapper.appendChild(fragment);
+          workingRange.insertNode(wrapper);
+        }
+
+        updateRangeSelection(wrapper);
+        lastFocusedEditable = target;
+        return true;
+      }
+
+      const sizeTarget = getFontSizeTarget();
+      if (!sizeTarget) {
+        return false;
+      }
+
+      const nextSize = Math.max(10, Math.min(getElementFontSize(sizeTarget) + safeDelta, 72));
+      sizeTarget.style.fontSize = nextSize + 'px';
+      lastFocusedEditable = target;
+      return true;
+    }
+
+    function resetFontSize(value) {
+      const sizeTarget = getFontSizeTarget();
+      if (!sizeTarget) {
+        return false;
+      }
+
+      const nextSize = Math.max(10, Math.min(Number(value) || 16, 72));
+      sizeTarget.style.fontSize = nextSize + 'px';
+      return true;
+    }
+
+    function insertImageIntoPreview(dataUrl) {
+      const target = focusEditableTarget();
+      if (!target || !dataUrl) {
+        return false;
+      }
+
+      const imageHtml =
+        '<img src="' +
+        dataUrl +
+        '" alt="Inserted image" style="max-width: 100%; height: auto; display: block; margin: 12px auto;" />';
+
+      document.execCommand('insertHTML', false, imageHtml);
+      setTimeout(function() {
+        const images = target.querySelectorAll('img');
+        const lastImage = images[images.length - 1];
+        if (lastImage) {
+          setSelectedImage(lastImage);
+        }
+      }, 0);
+      return true;
+    }
+
+    function scaleSelectedImage(factor) {
+      if (!selectedImage) {
+        return false;
+      }
+
+      const currentWidth =
+        selectedImage.getBoundingClientRect().width ||
+        selectedImage.clientWidth ||
+        selectedImage.naturalWidth ||
+        180;
+      const nextWidth = Math.max(48, Math.min(currentWidth * factor, 1400));
+
+      selectedImage.style.width = nextWidth + 'px';
+      selectedImage.style.maxWidth = '100%';
+      selectedImage.style.height = 'auto';
+      updateSelectedImageOverlayPosition();
+      return true;
+    }
+
+    function getPointerCoords(event) {
+      if (event.touches && event.touches.length > 0) {
+        return {
+          clientX: event.touches[0].clientX,
+          clientY: event.touches[0].clientY,
+        };
+      }
+
+      if (event.changedTouches && event.changedTouches.length > 0) {
+        return {
+          clientX: event.changedTouches[0].clientX,
+          clientY: event.changedTouches[0].clientY,
+        };
+      }
+
+      return {
+        clientX: event.clientX,
+        clientY: event.clientY,
+      };
+    }
+
+    function startImageResize(event) {
+      if (!selectedImage) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const pointer = getPointerCoords(event);
+      activeImageResize = {
+        startClientX: pointer.clientX,
+        startWidth:
+          selectedImage.getBoundingClientRect().width ||
+          selectedImage.clientWidth ||
+          selectedImage.naturalWidth ||
+          180,
+      };
+    }
+
+    function updateImageResize(event) {
+      if (!activeImageResize || !selectedImage) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const pointer = getPointerCoords(event);
+      const deltaX = pointer.clientX - activeImageResize.startClientX;
+      const nextWidth = Math.max(48, Math.min(activeImageResize.startWidth + deltaX, 1400));
+
+      selectedImage.style.width = nextWidth + 'px';
+      selectedImage.style.maxWidth = '100%';
+      selectedImage.style.height = 'auto';
+      updateSelectedImageOverlayPosition();
+    }
+
+    function endImageResize(event) {
+      if (!activeImageResize) {
+        return;
+      }
+
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+
+      activeImageResize = null;
+      updateSelectedImageOverlayPosition();
     }
 
     function attachSheetTabHandlers() {
@@ -636,7 +1001,67 @@ export function getOfficePreviewHtml(base64Data, options = {}) {
     }
 
     function handleOfficePreviewCommand(command) {
-      if (!command || command.command !== 'exportPreview') {
+      if (!command) {
+        return;
+      }
+
+      if (command.command === 'officeFormat') {
+        switch (command.action) {
+          case 'bold':
+            execFormattingCommand('bold');
+            break;
+          case 'italic':
+            execFormattingCommand('italic');
+            break;
+          case 'underline':
+            execFormattingCommand('underline');
+            break;
+          case 'setColor':
+            execFormattingCommand('foreColor', command.value || '#000000');
+            break;
+          case 'setFontSize':
+            execFormattingCommand('fontSize', command.value || '3');
+            break;
+          case 'adjustFontSize':
+            if (!adjustFontSize(command.value)) {
+              sendMessage({
+                type: 'officePreviewCommandError',
+                message: 'Tap or select text first, then change the font size.',
+              });
+            }
+            break;
+          case 'resetFontSize':
+            if (!resetFontSize(command.value)) {
+              sendMessage({
+                type: 'officePreviewCommandError',
+                message: 'Tap inside the editable text first.',
+              });
+            }
+            break;
+          case 'setFontFamily':
+            execFormattingCommand('fontName', command.value || 'Arial');
+            break;
+          case 'insertImage':
+            if (!insertImageIntoPreview(command.dataUrl || '')) {
+              sendMessage({
+                type: 'officePreviewCommandError',
+                message: 'Select an editable area before inserting an image.',
+              });
+            }
+            break;
+          case 'scaleImage':
+            if (!scaleSelectedImage(Number(command.value) || 1)) {
+              sendMessage({
+                type: 'officePreviewCommandError',
+                message: 'Tap an image first, then use the resize buttons.',
+              });
+            }
+            break;
+        }
+        return;
+      }
+
+      if (command.command !== 'exportPreview') {
         return;
       }
 
@@ -668,6 +1093,38 @@ export function getOfficePreviewHtml(base64Data, options = {}) {
     document.addEventListener('message', function(event) {
       handleIncomingMessage(event.data);
     });
+    document.addEventListener('focusin', function(event) {
+      rememberEditableTarget(event.target);
+    });
+    document.addEventListener('click', function(event) {
+      rememberEditableTarget(event.target);
+
+      if (event.target instanceof HTMLImageElement && previewRoot.contains(event.target)) {
+        setSelectedImage(event.target);
+        return;
+      }
+
+      if (previewRoot.contains(event.target)) {
+        clearSelectedImage();
+      }
+    });
+    imageSelectionHandle.addEventListener('mousedown', startImageResize);
+    imageSelectionHandle.addEventListener('touchstart', startImageResize, {
+      passive: false,
+    });
+    document.addEventListener('mousemove', updateImageResize);
+    document.addEventListener('mouseup', endImageResize);
+    document.addEventListener('touchmove', updateImageResize, {
+      passive: false,
+    });
+    document.addEventListener('touchend', endImageResize, {
+      passive: false,
+    });
+    document.addEventListener('touchcancel', endImageResize, {
+      passive: false,
+    });
+    window.addEventListener('resize', updateSelectedImageOverlayPosition);
+    window.addEventListener('scroll', updateSelectedImageOverlayPosition, true);
 
     window.addEventListener(
       'error',
