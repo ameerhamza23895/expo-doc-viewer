@@ -207,49 +207,77 @@ export function getPdfViewerHtml(base64Data) {
       }
     }
 
+    // ---- Helper to get coordinates from touch or mouse event ----
+    function getEventCoords(e) {
+      if (e.touches && e.touches.length > 0) {
+        return { clientX: e.touches[0].clientX, clientY: e.touches[0].clientY };
+      }
+      if (e.changedTouches && e.changedTouches.length > 0) {
+        return { clientX: e.changedTouches[0].clientX, clientY: e.changedTouches[0].clientY };
+      }
+      return { clientX: e.clientX, clientY: e.clientY };
+    }
+
     // ---- Highlight logic ----
     function setupAnnotationLayer(overlay, pageNum) {
       let startX, startY, rect;
 
-      overlay.addEventListener('pointerdown', (e) => {
+      function onDown(e) {
+        if (currentMode !== 'highlight' && currentMode !== 'text') return;
+        e.preventDefault();
+        e.stopPropagation();
+        const coords = getEventCoords(e);
+        const bounds = overlay.getBoundingClientRect();
+        const x = coords.clientX - bounds.left;
+        const y = coords.clientY - bounds.top;
+
         if (currentMode === 'highlight') {
-          const bounds = overlay.getBoundingClientRect();
-          startX = e.clientX - bounds.left;
-          startY = e.clientY - bounds.top;
+          startX = x;
+          startY = y;
           rect = document.createElement('div');
           rect.className = 'highlight-rect';
           rect.style.left = startX + 'px';
           rect.style.top = startY + 'px';
+          rect.style.width = '0px';
+          rect.style.height = '0px';
           rect.style.background = highlightColor;
           overlay.appendChild(rect);
         } else if (currentMode === 'text') {
-          const bounds = overlay.getBoundingClientRect();
-          const x = e.clientX - bounds.left;
-          const y = e.clientY - bounds.top;
           promptTextNote(overlay, pageNum, x, y);
         }
-      });
+      }
 
-      overlay.addEventListener('pointermove', (e) => {
+      function onMove(e) {
         if (currentMode === 'highlight' && rect) {
+          e.preventDefault();
+          e.stopPropagation();
+          const coords = getEventCoords(e);
           const bounds = overlay.getBoundingClientRect();
-          const curX = e.clientX - bounds.left;
-          const curY = e.clientY - bounds.top;
+          const curX = coords.clientX - bounds.left;
+          const curY = coords.clientY - bounds.top;
           rect.style.left = Math.min(startX, curX) + 'px';
           rect.style.top = Math.min(startY, curY) + 'px';
           rect.style.width = Math.abs(curX - startX) + 'px';
           rect.style.height = Math.abs(curY - startY) + 'px';
         }
-      });
+      }
 
-      overlay.addEventListener('pointerup', (e) => {
+      function onUp(e) {
         if (currentMode === 'highlight' && rect) {
           const w = parseInt(rect.style.width) || 0;
           const h = parseInt(rect.style.height) || 0;
           if (w < 5 && h < 5) {
             overlay.removeChild(rect);
           } else {
-            // Add delete on double-tap
+            // Add delete on long-press (since dblclick is unreliable on mobile)
+            let pressTimer;
+            rect.addEventListener('touchstart', function() {
+              pressTimer = setTimeout(() => {
+                overlay.removeChild(rect);
+                sendMessage({ type: 'annotationRemoved', page: pageNum });
+              }, 800);
+            });
+            rect.addEventListener('touchend', function() { clearTimeout(pressTimer); });
             rect.addEventListener('dblclick', () => {
               overlay.removeChild(rect);
               sendMessage({ type: 'annotationRemoved', page: pageNum });
@@ -264,7 +292,16 @@ export function getPdfViewerHtml(base64Data) {
           }
           rect = null;
         }
-      });
+      }
+
+      // Touch events (primary for mobile)
+      overlay.addEventListener('touchstart', onDown, { passive: false });
+      overlay.addEventListener('touchmove', onMove, { passive: false });
+      overlay.addEventListener('touchend', onUp);
+      // Mouse events (fallback)
+      overlay.addEventListener('mousedown', onDown);
+      overlay.addEventListener('mousemove', onMove);
+      overlay.addEventListener('mouseup', onUp);
     }
 
     function promptTextNote(overlay, pageNum, x, y) {
@@ -296,23 +333,29 @@ export function getPdfViewerHtml(base64Data) {
       let drawing = false;
       let lastX, lastY;
 
-      canvas.addEventListener('pointerdown', (e) => {
+      function onDrawStart(e) {
         if (currentMode !== 'draw') return;
+        e.preventDefault();
+        e.stopPropagation();
         drawing = true;
+        const coords = getEventCoords(e);
         const bounds = canvas.getBoundingClientRect();
         const scaleX = canvas.width / bounds.width;
         const scaleY = canvas.height / bounds.height;
-        lastX = (e.clientX - bounds.left) * scaleX;
-        lastY = (e.clientY - bounds.top) * scaleY;
-      });
+        lastX = (coords.clientX - bounds.left) * scaleX;
+        lastY = (coords.clientY - bounds.top) * scaleY;
+      }
 
-      canvas.addEventListener('pointermove', (e) => {
+      function onDrawMove(e) {
         if (!drawing || currentMode !== 'draw') return;
+        e.preventDefault();
+        e.stopPropagation();
+        const coords = getEventCoords(e);
         const bounds = canvas.getBoundingClientRect();
         const scaleX = canvas.width / bounds.width;
         const scaleY = canvas.height / bounds.height;
-        const x = (e.clientX - bounds.left) * scaleX;
-        const y = (e.clientY - bounds.top) * scaleY;
+        const x = (coords.clientX - bounds.left) * scaleX;
+        const y = (coords.clientY - bounds.top) * scaleY;
         ctx.beginPath();
         ctx.moveTo(lastX, lastY);
         ctx.lineTo(x, y);
@@ -322,14 +365,23 @@ export function getPdfViewerHtml(base64Data) {
         ctx.stroke();
         lastX = x;
         lastY = y;
-      });
+      }
 
-      canvas.addEventListener('pointerup', () => {
+      function onDrawEnd() {
         if (drawing) {
           drawing = false;
           sendMessage({ type: 'drawingAdded', page: pageNum });
         }
-      });
+      }
+
+      // Touch events (primary for mobile)
+      canvas.addEventListener('touchstart', onDrawStart, { passive: false });
+      canvas.addEventListener('touchmove', onDrawMove, { passive: false });
+      canvas.addEventListener('touchend', onDrawEnd);
+      // Mouse events (fallback)
+      canvas.addEventListener('mousedown', onDrawStart);
+      canvas.addEventListener('mousemove', onDrawMove);
+      canvas.addEventListener('mouseup', onDrawEnd);
     }
 
     // ---- Mode switching (called from RN) ----
