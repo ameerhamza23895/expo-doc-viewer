@@ -10,6 +10,7 @@ export function getPdfViewerHtml(base64Data, options = {}) {
   const initialHighlightColor = JSON.stringify(
     options.initialHighlightColor || '#FF000066'
   );
+  const initialSelectedPage = Math.max(1, Number(options.initialSelectedPage) || 1);
 
   return `
 <!DOCTYPE html>
@@ -43,6 +44,14 @@ export function getPdfViewerHtml(base64Data, options = {}) {
       box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
       margin: 0 auto;
       overflow: hidden;
+      transition: box-shadow 140ms ease, transform 140ms ease;
+    }
+    .page-wrapper.selected {
+      box-shadow:
+        0 0 0 3px rgba(255, 255, 255, 0.98),
+        0 0 0 6px rgba(25, 118, 210, 0.88),
+        0 14px 30px rgba(0, 0, 0, 0.35);
+      transform: translateY(-1px);
     }
     .page-wrapper canvas {
       display: block;
@@ -111,6 +120,10 @@ export function getPdfViewerHtml(base64Data, options = {}) {
       color: #aaa;
       font-size: 11px;
       padding: 2px 0 6px;
+      transition: color 140ms ease;
+    }
+    .page-label.selected {
+      color: #f3f7ff;
     }
     #loading {
       position: fixed;
@@ -147,6 +160,7 @@ export function getPdfViewerHtml(base64Data, options = {}) {
     let annotations = normalizeAnnotations(${initialAnnotations});
     let pdfDoc = null;
     let totalPages = 0;
+    let selectedPage = ${initialSelectedPage};
     let selectedAnnotation = null;
     let activeDrag = null;
     let suppressNextClick = false;
@@ -514,6 +528,8 @@ export function getPdfViewerHtml(base64Data, options = {}) {
     }
 
     function updateDomSelection() {
+      updatePageSelection();
+
       document.querySelectorAll('.highlight-rect, .text-note').forEach((element) => {
         const isSelected =
           !!selectedAnnotation &&
@@ -528,8 +544,37 @@ export function getPdfViewerHtml(base64Data, options = {}) {
       }
     }
 
+    function updatePageSelection() {
+      document.querySelectorAll('.page-wrapper').forEach((element) => {
+        element.classList.toggle('selected', Number(element.dataset.page) === selectedPage);
+      });
+
+      document.querySelectorAll('.page-label').forEach((element) => {
+        element.classList.toggle('selected', Number(element.dataset.page) === selectedPage);
+      });
+    }
+
+    function setSelectedPage(pageNum, silent) {
+      if (!totalPages) {
+        return;
+      }
+
+      const nextPage = clamp(safeNumber(pageNum, 1), 1, totalPages);
+      const didChange = nextPage !== selectedPage;
+      selectedPage = nextPage;
+      updatePageSelection();
+
+      if (!silent && didChange) {
+        sendMessage({
+          type: 'pageSelected',
+          page: selectedPage,
+        });
+      }
+    }
+
     function selectAnnotation(annotation) {
       if (annotation) {
+        setSelectedPage(annotation.page);
         selectedAnnotation = {
           id: annotation.id,
           type: annotation.type,
@@ -844,6 +889,63 @@ export function getPdfViewerHtml(base64Data, options = {}) {
     function setupAnnotationLayer(overlay, pageNum) {
       let draftRect = null;
       let startPoint = null;
+      let pagePressTimer = null;
+      let pagePressStartCoords = null;
+      let pagePressTriggered = false;
+
+      function clearPagePress() {
+        if (pagePressTimer) {
+          clearTimeout(pagePressTimer);
+          pagePressTimer = null;
+        }
+        pagePressStartCoords = null;
+        pagePressTriggered = false;
+      }
+
+      function startPagePress(event) {
+        if (event.target !== overlay) {
+          return;
+        }
+
+        pagePressStartCoords = getEventCoords(event);
+        pagePressTriggered = false;
+        pagePressTimer = setTimeout(() => {
+          pagePressTimer = null;
+          pagePressTriggered = true;
+          setSelectedPage(pageNum);
+          selectAnnotation(null);
+          suppressNextClick = true;
+          sendMessage({
+            type: 'pageLongPressed',
+            page: pageNum,
+          });
+        }, 420);
+      }
+
+      function movePagePress(event) {
+        if (!pagePressTimer || !pagePressStartCoords) {
+          return;
+        }
+
+        const coords = getEventCoords(event);
+        const deltaX = coords.clientX - pagePressStartCoords.clientX;
+        const deltaY = coords.clientY - pagePressStartCoords.clientY;
+
+        if (Math.sqrt(deltaX * deltaX + deltaY * deltaY) > 6) {
+          clearPagePress();
+        }
+      }
+
+      function finishPagePress() {
+        const didLongPress = pagePressTriggered;
+        if (pagePressTimer) {
+          clearTimeout(pagePressTimer);
+          pagePressTimer = null;
+        }
+        pagePressStartCoords = null;
+        pagePressTriggered = false;
+        return didLongPress;
+      }
 
       function onDown(event) {
         if (
@@ -870,7 +972,12 @@ export function getPdfViewerHtml(base64Data, options = {}) {
               },
               event
             );
+            return;
           }
+        }
+
+        if (currentMode === 'view') {
+          startPagePress(event);
           return;
         }
 
@@ -900,6 +1007,11 @@ export function getPdfViewerHtml(base64Data, options = {}) {
       }
 
       function onMove(event) {
+        if (currentMode === 'view') {
+          movePagePress(event);
+          return;
+        }
+
         if (currentMode !== 'highlight' || !draftRect || !startPoint) {
           return;
         }
@@ -911,6 +1023,11 @@ export function getPdfViewerHtml(base64Data, options = {}) {
       }
 
       function onUp(event) {
+        if (currentMode === 'view') {
+          finishPagePress();
+          return;
+        }
+
         if (currentMode !== 'highlight' || !draftRect || !startPoint) {
           return;
         }
@@ -943,9 +1060,11 @@ export function getPdfViewerHtml(base64Data, options = {}) {
       overlay.addEventListener('touchstart', onDown, { passive: false });
       overlay.addEventListener('touchmove', onMove, { passive: false });
       overlay.addEventListener('touchend', onUp, { passive: false });
+      overlay.addEventListener('touchcancel', clearPagePress);
       overlay.addEventListener('mousedown', onDown);
       overlay.addEventListener('mousemove', onMove);
       overlay.addEventListener('mouseup', onUp);
+      overlay.addEventListener('mouseleave', clearPagePress);
 
       overlay.addEventListener('click', (event) => {
         if (currentMode !== 'view' || event.target !== overlay) {
@@ -969,6 +1088,7 @@ export function getPdfViewerHtml(base64Data, options = {}) {
           });
         } else {
           selectAnnotation(null);
+          setSelectedPage(pageNum);
         }
       });
     }
@@ -1213,6 +1333,7 @@ export function getPdfViewerHtml(base64Data, options = {}) {
 
         document.getElementById('loading').style.display = 'none';
         updateInteractionMode();
+        setSelectedPage(selectedPage, true);
         sendMessage({ type: 'pdfLoaded', totalPages });
       } catch (error) {
         document.getElementById('loading').style.display = 'none';
@@ -1266,6 +1387,7 @@ export function getPdfViewerHtml(base64Data, options = {}) {
 
       const label = document.createElement('div');
       label.className = 'page-label';
+      label.dataset.page = pageNum;
       label.textContent = 'Page ' + pageNum + ' of ' + totalPages;
 
       const container = document.getElementById('pdf-container');

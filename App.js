@@ -44,9 +44,18 @@ const COLORS = [
 const DEFAULT_COLOR = COLORS[0].value;
 const HIGHLIGHT_ALPHA_HEX = '66';
 const ANNOTATION_STORAGE_DIR = `${Paths.document.uri}annotation-state/`;
+const WORKING_PDF_SUFFIX = '.working.pdf';
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function createEmptyPageAnnotations() {
+  return {
+    highlights: [],
+    drawings: [],
+    notes: [],
+  };
 }
 
 function normalizeAnnotationState(rawAnnotations) {
@@ -59,15 +68,16 @@ function normalizeAnnotationState(rawAnnotations) {
       return pages;
     }
 
-    pages[pageKey] = {
-      highlights: Array.isArray(pageAnnotations.highlights)
-        ? pageAnnotations.highlights
-        : [],
-      drawings: Array.isArray(pageAnnotations.drawings)
-        ? pageAnnotations.drawings
-        : [],
-      notes: Array.isArray(pageAnnotations.notes) ? pageAnnotations.notes : [],
-    };
+    pages[pageKey] = createEmptyPageAnnotations();
+    pages[pageKey].highlights = Array.isArray(pageAnnotations.highlights)
+      ? pageAnnotations.highlights
+      : [];
+    pages[pageKey].drawings = Array.isArray(pageAnnotations.drawings)
+      ? pageAnnotations.drawings
+      : [];
+    pages[pageKey].notes = Array.isArray(pageAnnotations.notes)
+      ? pageAnnotations.notes
+      : [];
 
     return pages;
   }, {});
@@ -89,6 +99,53 @@ function hasAnnotations(annotationState = {}) {
 
 function getAnnotationStorageUri(documentKey) {
   return `${ANNOTATION_STORAGE_DIR}${documentKey}.json`;
+}
+
+function getWorkingPdfStorageUri(documentKey) {
+  return `${ANNOTATION_STORAGE_DIR}${documentKey}${WORKING_PDF_SUFFIX}`;
+}
+
+async function deleteFileIfExists(uri) {
+  const info = await LegacyFileSystem.getInfoAsync(uri);
+  if (info.exists) {
+    await LegacyFileSystem.deleteAsync(uri);
+  }
+}
+
+function insertPageIntoAnnotationState(rawAnnotations, afterPageNumber) {
+  const normalizedAnnotations = normalizeAnnotationState(rawAnnotations);
+  const nextAnnotations = {
+    [afterPageNumber + 1]: createEmptyPageAnnotations(),
+  };
+
+  Object.entries(normalizedAnnotations)
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .forEach(([pageKey, pageAnnotations]) => {
+      const pageNumber = Number(pageKey);
+      const nextPageNumber = pageNumber <= afterPageNumber ? pageNumber : pageNumber + 1;
+      nextAnnotations[nextPageNumber] = pageAnnotations;
+    });
+
+  return nextAnnotations;
+}
+
+function removePageFromAnnotationState(rawAnnotations, removedPageNumber) {
+  const normalizedAnnotations = normalizeAnnotationState(rawAnnotations);
+  const nextAnnotations = {};
+
+  Object.entries(normalizedAnnotations)
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .forEach(([pageKey, pageAnnotations]) => {
+      const pageNumber = Number(pageKey);
+      if (pageNumber === removedPageNumber) {
+        return;
+      }
+
+      const nextPageNumber = pageNumber < removedPageNumber ? pageNumber : pageNumber - 1;
+      nextAnnotations[nextPageNumber] = pageAnnotations;
+    });
+
+  return nextAnnotations;
 }
 
 function sanitizeFileSegment(value = 'document') {
@@ -221,6 +278,132 @@ function wrapNoteText(text, font, fontSize, maxWidth) {
   return lines.length ? lines : [''];
 }
 
+async function bakePdfWithAnnotations(base64Contents, annotationState) {
+  const pdfDocument = await PDFDocument.load(base64Contents);
+  const noteFont = await pdfDocument.embedFont(StandardFonts.Helvetica);
+  const pages = pdfDocument.getPages();
+
+  Object.entries(annotationState).forEach(([pageKey, pageAnnotations]) => {
+    const page = pages[Number(pageKey) - 1];
+    if (!page) {
+      return;
+    }
+
+    const { width, height } = page.getSize();
+
+    (pageAnnotations.highlights || []).forEach((highlight) => {
+      const highlightWidth = clamp(Number(highlight.width) || 0, 0, 1) * width;
+      const highlightHeight = clamp(Number(highlight.height) || 0, 0, 1) * height;
+
+      if (highlightWidth < 1 || highlightHeight < 1) {
+        return;
+      }
+
+      const { color, opacity } = parseHexColor(highlight.color, 0.4);
+      const x = clamp(Number(highlight.x) || 0, 0, 1) * width;
+      const y =
+        height -
+        (clamp(Number(highlight.y) || 0, 0, 1) + clamp(Number(highlight.height) || 0, 0, 1)) *
+          height;
+
+      page.drawRectangle({
+        x,
+        y,
+        width: highlightWidth,
+        height: highlightHeight,
+        color,
+        opacity,
+        blendMode: BlendMode.Multiply,
+      });
+    });
+
+    (pageAnnotations.drawings || []).forEach((drawing) => {
+      const pdfPoints = (drawing.points || []).map((point) =>
+        normalizePdfPoint(point, width, height)
+      );
+
+      if (!pdfPoints.length) {
+        return;
+      }
+
+      const { color, opacity } = parseHexColor(drawing.color, 1);
+      const thickness = Math.max(
+        clamp(Number(drawing.width) || 0.006, 0.001, 0.05) * width,
+        1.2
+      );
+
+      if (pdfPoints.length === 1) {
+        page.drawCircle({
+          x: pdfPoints[0].x,
+          y: pdfPoints[0].y,
+          size: Math.max(thickness / 2, 0.8),
+          color,
+          opacity,
+        });
+        return;
+      }
+
+      for (let index = 0; index < pdfPoints.length - 1; index += 1) {
+        page.drawLine({
+          start: pdfPoints[index],
+          end: pdfPoints[index + 1],
+          thickness,
+          color,
+          opacity,
+          lineCap: LineCapStyle.Round,
+        });
+      }
+    });
+
+    (pageAnnotations.notes || []).forEach((note) => {
+      const fontSize = 12;
+      const lineHeight = fontSize * 1.25;
+      const maxTextWidth = Math.min(width * 0.35, 180);
+      const lines = wrapNoteText(note.text, noteFont, fontSize, maxTextWidth);
+      const textWidth = lines.reduce((currentWidth, line) => {
+        const measuredWidth = noteFont.widthOfTextAtSize(line || ' ', fontSize);
+        return Math.max(currentWidth, measuredWidth);
+      }, 40);
+
+      const noteWidth = Math.min(textWidth + 14, width * 0.42);
+      const noteHeight = Math.max(lines.length * lineHeight + 14, 28);
+      const x = clamp(
+        (Number(note.x) || 0) * width,
+        8,
+        Math.max(width - noteWidth - 8, 8)
+      );
+      const y = clamp(
+        height - (clamp(Number(note.y) || 0, 0, 1) * height) - noteHeight,
+        8,
+        Math.max(height - noteHeight - 8, 8)
+      );
+
+      page.drawRectangle({
+        x,
+        y,
+        width: noteWidth,
+        height: noteHeight,
+        color: rgb(1, 0.976, 0.769),
+        borderWidth: 1,
+        borderColor: rgb(0.976, 0.659, 0.145),
+        opacity: 0.98,
+      });
+
+      lines.forEach((line, index) => {
+        page.drawText(line, {
+          x: x + 7,
+          y: y + noteHeight - 9 - fontSize - index * lineHeight,
+          size: fontSize,
+          font: noteFont,
+          color: rgb(0.2, 0.2, 0.2),
+        });
+      });
+    });
+  });
+
+  return pdfDocument.saveAsBase64();
+}
+
 function getSelectedAnnotationDescription(selectedAnnotation) {
   if (!selectedAnnotation) {
     return 'Tap any highlight, drawing, or note to select it.';
@@ -302,6 +485,10 @@ export default function App() {
   const [totalPages, setTotalPages] = useState(0);
   const [textNoteModal, setTextNoteModal] = useState(null);
   const [noteText, setNoteText] = useState('');
+  const [showPageEditorModal, setShowPageEditorModal] = useState(false);
+  const [pageNumberInput, setPageNumberInput] = useState('1');
+  const [pageEditorBusy, setPageEditorBusy] = useState(false);
+  const [viewerInstanceId, setViewerInstanceId] = useState(0);
 
   const webViewRef = useRef(null);
   const annotationWriteQueueRef = useRef(Promise.resolve());
@@ -325,35 +512,222 @@ export default function App() {
     annotationDirectoryReadyRef.current = true;
   }, []);
 
+  const buildViewerHtml = useCallback(
+    (nextBase64, nextAnnotations, nextMode = 'view', nextSelectedPage = 1) =>
+      getPdfViewerHtml(nextBase64, {
+        initialAnnotations: nextAnnotations,
+        initialMode: nextMode,
+        initialDrawColor: activeColor,
+        initialHighlightColor: activeColor + HIGHLIGHT_ALPHA_HEX,
+        initialSelectedPage: nextSelectedPage,
+      }),
+    [activeColor]
+  );
+
+  const writeAnnotationSnapshot = useCallback(
+    async (nextDocumentKey, nextAnnotations) => {
+      if (!nextDocumentKey) {
+        return;
+      }
+
+      const normalizedAnnotations = normalizeAnnotationState(nextAnnotations);
+      await ensureAnnotationStorageDirectory();
+      const annotationUri = getAnnotationStorageUri(nextDocumentKey);
+
+      if (!hasAnnotations(normalizedAnnotations)) {
+        const info = await LegacyFileSystem.getInfoAsync(annotationUri);
+        if (info.exists) {
+          await LegacyFileSystem.deleteAsync(annotationUri);
+        }
+        return;
+      }
+
+      await LegacyFileSystem.writeAsStringAsync(
+        annotationUri,
+        JSON.stringify({
+          version: 1,
+          annotations: normalizedAnnotations,
+        })
+      );
+    },
+    [ensureAnnotationStorageDirectory]
+  );
+
+  const writeWorkingPdfCopy = useCallback(
+    async (nextDocumentKey, nextBase64) => {
+      if (!nextDocumentKey || !nextBase64) {
+        return;
+      }
+
+      await ensureAnnotationStorageDirectory();
+      const workingPdfUri = getWorkingPdfStorageUri(nextDocumentKey);
+      await LegacyFileSystem.writeAsStringAsync(workingPdfUri, nextBase64, {
+        encoding: LegacyFileSystem.EncodingType.Base64,
+      });
+    },
+    [ensureAnnotationStorageDirectory]
+  );
+
+  const loadWorkingPdfCopy = useCallback(
+    async (nextDocumentKey) => {
+      if (!nextDocumentKey) {
+        return null;
+      }
+
+      await ensureAnnotationStorageDirectory();
+      const workingPdfUri = getWorkingPdfStorageUri(nextDocumentKey);
+      const info = await LegacyFileSystem.getInfoAsync(workingPdfUri);
+
+      if (!info.exists) {
+        return null;
+      }
+
+      return LegacyFileSystem.readAsStringAsync(workingPdfUri, {
+        encoding: LegacyFileSystem.EncodingType.Base64,
+      });
+    },
+    [ensureAnnotationStorageDirectory]
+  );
+
+  const clearPersistedPdfEditState = useCallback(
+    async (nextDocumentKey) => {
+      if (!nextDocumentKey) {
+        return;
+      }
+
+      await ensureAnnotationStorageDirectory();
+      await Promise.all([
+        deleteFileIfExists(getAnnotationStorageUri(nextDocumentKey)),
+        deleteFileIfExists(getWorkingPdfStorageUri(nextDocumentKey)),
+      ]);
+    },
+    [ensureAnnotationStorageDirectory]
+  );
+
+  const promptForPdfResumeChoice = useCallback(
+    (nextDocumentName) =>
+      new Promise((resolve) => {
+        let didResolve = false;
+        const finish = (choice) => {
+          if (!didResolve) {
+            didResolve = true;
+            resolve(choice);
+          }
+        };
+
+        Alert.alert(
+          'Resume Previous Edit?',
+          `We found a saved local working copy for ${nextDocumentName}. Continue editing that copy, or reset back to the original PDF?`,
+          [
+            {
+              text: 'Cancel',
+              style: 'cancel',
+              onPress: () => finish('cancel'),
+            },
+            {
+              text: 'Open Original',
+              style: 'destructive',
+              onPress: () => finish('reset'),
+            },
+            {
+              text: 'Continue Edit',
+              onPress: () => finish('continue'),
+            },
+          ],
+          {
+            cancelable: true,
+            onDismiss: () => finish('cancel'),
+          }
+        );
+      }),
+    []
+  );
+
+  const loadEditablePdfBase64 = useCallback(async () => {
+    if (documentKey) {
+      const workingPdfBase64 = await loadWorkingPdfCopy(documentKey);
+      if (workingPdfBase64) {
+        return workingPdfBase64;
+      }
+    }
+
+    return base64Data;
+  }, [base64Data, documentKey, loadWorkingPdfCopy]);
+
+  const buildEditedPdfFile = useCallback(
+    async (outputDirectoryUri = Paths.cache.uri) => {
+      const editablePdfBase64 = await loadEditablePdfBase64();
+
+      if (!editablePdfBase64) {
+        throw new Error('No editable PDF data found.');
+      }
+
+      const bakedPdfBase64 = await bakePdfWithAnnotations(
+        editablePdfBase64,
+        annotationState
+      );
+      const fileName = buildAnnotatedFileName(documentName);
+      const outputUri = `${outputDirectoryUri}${fileName}`;
+
+      await LegacyFileSystem.writeAsStringAsync(outputUri, bakedPdfBase64, {
+        encoding: LegacyFileSystem.EncodingType.Base64,
+      });
+
+      return {
+        bakedPdfBase64,
+        fileName,
+        outputUri,
+      };
+    },
+    [annotationState, documentName, loadEditablePdfBase64]
+  );
+
+  const promptForPdfShareChoice = useCallback(
+    () =>
+      new Promise((resolve) => {
+        let didResolve = false;
+        const finish = (choice) => {
+          if (!didResolve) {
+            didResolve = true;
+            resolve(choice);
+          }
+        };
+
+        Alert.alert(
+          'Share PDF',
+          'Choose whether to share the original imported PDF or the current edited PDF copy.',
+          [
+            {
+              text: 'Cancel',
+              style: 'cancel',
+              onPress: () => finish('cancel'),
+            },
+            {
+              text: 'Share Original',
+              onPress: () => finish('original'),
+            },
+            {
+              text: 'Share Edited PDF',
+              onPress: () => finish('edited'),
+            },
+          ],
+          {
+            cancelable: true,
+            onDismiss: () => finish('cancel'),
+          }
+        );
+      }),
+    []
+  );
+
   const persistAnnotationState = useCallback(
     (nextDocumentKey, nextAnnotations) => {
       if (!nextDocumentKey) {
         return;
       }
 
-      const normalizedAnnotations = normalizeAnnotationState(nextAnnotations);
-
       annotationWriteQueueRef.current = annotationWriteQueueRef.current
-        .then(async () => {
-          await ensureAnnotationStorageDirectory();
-          const annotationUri = getAnnotationStorageUri(nextDocumentKey);
-
-          if (!hasAnnotations(normalizedAnnotations)) {
-            const info = await LegacyFileSystem.getInfoAsync(annotationUri);
-            if (info.exists) {
-              await LegacyFileSystem.deleteAsync(annotationUri);
-            }
-            return;
-          }
-
-          await LegacyFileSystem.writeAsStringAsync(
-            annotationUri,
-            JSON.stringify({
-              version: 1,
-              annotations: normalizedAnnotations,
-            })
-          );
-        })
+        .then(() => writeAnnotationSnapshot(nextDocumentKey, nextAnnotations))
         .catch((error) => {
           Alert.alert(
             'Annotation Save Error',
@@ -361,7 +735,7 @@ export default function App() {
           );
         });
     },
-    [ensureAnnotationStorageDirectory]
+    [writeAnnotationSnapshot]
   );
 
   const loadPersistedAnnotations = useCallback(
@@ -383,6 +757,33 @@ export default function App() {
       return normalizeAnnotationState(parsed.annotations || parsed);
     },
     [ensureAnnotationStorageDirectory]
+  );
+
+  const applyPdfEditorState = useCallback(
+    (
+      nextBase64,
+      nextAnnotations,
+      nextPageCount,
+      nextMode = 'view',
+      nextSelectedPage = 1
+    ) => {
+      const safeSelectedPage = Math.max(
+        1,
+        Math.min(nextSelectedPage, Math.max(nextPageCount, 1))
+      );
+      setBase64Data(nextBase64);
+      setAnnotationState(nextAnnotations);
+      setSelectedAnnotation(null);
+      setActiveTool(nextMode);
+      setShowColorPicker(nextMode === 'draw' || nextMode === 'highlight');
+      setTotalPages(nextPageCount);
+      setPageNumberInput(String(safeSelectedPage));
+      setViewerHtml(
+        buildViewerHtml(nextBase64, nextAnnotations, nextMode, safeSelectedPage)
+      );
+      setViewerInstanceId((currentValue) => currentValue + 1);
+    },
+    [buildViewerHtml]
   );
 
   const sendCommand = useCallback((command) => {
@@ -454,52 +855,88 @@ export default function App() {
       const extension = file.name.split('.').pop().toLowerCase();
 
       setLoading(true);
-      setDocumentUri(file.uri);
-      setDocumentName(file.name);
-      setDocumentType(extension);
-      setTotalPages(0);
-      setTextNoteModal(null);
-      setNoteText('');
-      setActiveTool('view');
-      setActiveColor(DEFAULT_COLOR);
-      setShowColorPicker(false);
-      setShowToolbar(true);
-      setSelectedAnnotation(null);
-      setAnnotationState({});
-      setBase64Data(null);
-      setViewerHtml(null);
 
       if (extension === 'pdf') {
         const fileInfo = await LegacyFileSystem.getInfoAsync(file.uri, { md5: true });
         const nextDocumentKey =
           fileInfo.md5 || `${file.name}-${fileInfo.size || Date.now()}`;
-        const [base64, persistedAnnotations] = await Promise.all([
+        const [originalBase64, persistedAnnotations, workingPdfBase64] = await Promise.all([
           LegacyFileSystem.readAsStringAsync(file.uri, {
             encoding: LegacyFileSystem.EncodingType.Base64,
           }),
           loadPersistedAnnotations(nextDocumentKey),
+          loadWorkingPdfCopy(nextDocumentKey),
         ]);
+        const hasSavedEdits =
+          !!workingPdfBase64 || hasAnnotations(persistedAnnotations);
+        let nextAnnotations = persistedAnnotations;
+        let activeBase64 = workingPdfBase64 || originalBase64;
 
+        if (hasSavedEdits) {
+          const resumeChoice = await promptForPdfResumeChoice(file.name);
+
+          if (resumeChoice === 'cancel') {
+            return;
+          }
+
+          if (resumeChoice === 'reset') {
+            await annotationWriteQueueRef.current;
+            await clearPersistedPdfEditState(nextDocumentKey);
+            nextAnnotations = {};
+            activeBase64 = originalBase64;
+          }
+        }
+
+        setDocumentUri(file.uri);
+        setDocumentName(file.name);
+        setDocumentType(extension);
         setDocumentKey(nextDocumentKey);
-        setBase64Data(base64);
-        setAnnotationState(persistedAnnotations);
-        setViewerHtml(
-          getPdfViewerHtml(base64, {
-            initialAnnotations: persistedAnnotations,
-            initialMode: 'view',
-            initialDrawColor: DEFAULT_COLOR,
-            initialHighlightColor: DEFAULT_COLOR + HIGHLIGHT_ALPHA_HEX,
-          })
-        );
+        setBase64Data(activeBase64);
+        setTotalPages(0);
+        setTextNoteModal(null);
+        setNoteText('');
+        setActiveTool('view');
+        setActiveColor(DEFAULT_COLOR);
+        setShowColorPicker(false);
+        setShowToolbar(true);
+        setSelectedAnnotation(null);
+        setAnnotationState(nextAnnotations);
+        setViewerHtml(buildViewerHtml(activeBase64, nextAnnotations, 'view', 1));
+        setViewerInstanceId((currentValue) => currentValue + 1);
+        setShowPageEditorModal(false);
+        setPageNumberInput('1');
       } else {
+        setDocumentUri(file.uri);
+        setDocumentName(file.name);
+        setDocumentType(extension);
         setDocumentKey(null);
+        setBase64Data(null);
+        setTotalPages(0);
+        setTextNoteModal(null);
+        setNoteText('');
+        setActiveTool('view');
+        setActiveColor(DEFAULT_COLOR);
+        setShowColorPicker(false);
+        setShowToolbar(true);
+        setSelectedAnnotation(null);
+        setAnnotationState({});
+        setViewerHtml(null);
+        setViewerInstanceId((currentValue) => currentValue + 1);
+        setShowPageEditorModal(false);
+        setPageNumberInput('1');
       }
     } catch (error) {
       Alert.alert('Error', 'Failed to pick document: ' + error.message);
     } finally {
       setLoading(false);
     }
-  }, [loadPersistedAnnotations]);
+  }, [
+    buildViewerHtml,
+    clearPersistedPdfEditState,
+    loadPersistedAnnotations,
+    loadWorkingPdfCopy,
+    promptForPdfResumeChoice,
+  ]);
 
   const copyDocument = useCallback(async () => {
     if (!documentUri) {
@@ -535,11 +972,28 @@ export default function App() {
         return;
       }
 
-      await Sharing.shareAsync(documentUri);
+      if (documentType !== 'pdf') {
+        await Sharing.shareAsync(documentUri);
+        return;
+      }
+
+      const shareChoice = await promptForPdfShareChoice();
+
+      if (shareChoice === 'cancel') {
+        return;
+      }
+
+      if (shareChoice === 'original') {
+        await Sharing.shareAsync(documentUri);
+        return;
+      }
+
+      const { outputUri } = await buildEditedPdfFile(Paths.cache.uri);
+      await Sharing.shareAsync(outputUri);
     } catch (error) {
       Alert.alert('Error', 'Failed to share: ' + error.message);
     }
-  }, [documentUri]);
+  }, [buildEditedPdfFile, documentType, documentUri, promptForPdfShareChoice]);
 
   const selectTool = useCallback(
     (toolId) => {
@@ -585,143 +1039,224 @@ export default function App() {
     ]);
   }, [sendCommand]);
 
+  const getValidatedPageNumber = useCallback(
+    (allowInsertAfterLast = false) => {
+      const parsedPageNumber = Number.parseInt(pageNumberInput, 10);
+      const upperBound = allowInsertAfterLast ? totalPages : totalPages;
+
+      if (!Number.isInteger(parsedPageNumber)) {
+        Alert.alert(
+          'Invalid Page',
+          'Tap a page in the PDF first so I know which page to edit.'
+        );
+        return null;
+      }
+
+      if (parsedPageNumber < 1 || parsedPageNumber > upperBound) {
+        Alert.alert(
+          'Invalid Page',
+          `Choose a page number between 1 and ${upperBound}.`
+        );
+        return null;
+      }
+
+      return parsedPageNumber;
+    },
+    [pageNumberInput, totalPages]
+  );
+
+  const removePdfPage = useCallback(async () => {
+    const pageNumber = getValidatedPageNumber(false);
+    if (!pageNumber || !base64Data || !documentKey) {
+      return;
+    }
+
+    if (totalPages <= 1) {
+      Alert.alert('Cannot Remove Page', 'A PDF must keep at least one page.');
+      return;
+    }
+
+    try {
+      setPageEditorBusy(true);
+      const pdfDocument = await PDFDocument.load(base64Data);
+      pdfDocument.removePage(pageNumber - 1);
+
+      const nextAnnotations = removePageFromAnnotationState(annotationState, pageNumber);
+      const nextBase64 = await pdfDocument.saveAsBase64();
+      const nextPageCount = pdfDocument.getPageCount();
+      const nextSelectedPage = Math.max(1, Math.min(pageNumber, nextPageCount));
+
+      await annotationWriteQueueRef.current;
+      await writeWorkingPdfCopy(documentKey, nextBase64);
+      await writeAnnotationSnapshot(documentKey, nextAnnotations);
+      applyPdfEditorState(
+        nextBase64,
+        nextAnnotations,
+        nextPageCount,
+        'view',
+        nextSelectedPage
+      );
+      setShowPageEditorModal(false);
+    } catch (error) {
+      Alert.alert('Page Update Failed', error.message);
+    } finally {
+      setPageEditorBusy(false);
+    }
+  }, [
+    annotationState,
+    applyPdfEditorState,
+    base64Data,
+    documentKey,
+    getValidatedPageNumber,
+    totalPages,
+    writeAnnotationSnapshot,
+    writeWorkingPdfCopy,
+  ]);
+
+  const insertBlankPdfPage = useCallback(async () => {
+    const pageNumber = getValidatedPageNumber(true);
+    if (!pageNumber || !base64Data || !documentKey) {
+      return;
+    }
+
+    try {
+      setPageEditorBusy(true);
+      const pdfDocument = await PDFDocument.load(base64Data);
+      const pages = pdfDocument.getPages();
+      const referencePage = pages[Math.min(pageNumber - 1, pages.length - 1)];
+      const { width, height } = referencePage.getSize();
+
+      pdfDocument.insertPage(pageNumber, [width, height]);
+
+      const nextAnnotations = insertPageIntoAnnotationState(annotationState, pageNumber);
+      const nextBase64 = await pdfDocument.saveAsBase64();
+      const nextPageCount = pdfDocument.getPageCount();
+      const nextSelectedPage = Math.min(pageNumber + 1, nextPageCount);
+
+      await annotationWriteQueueRef.current;
+      await writeWorkingPdfCopy(documentKey, nextBase64);
+      await writeAnnotationSnapshot(documentKey, nextAnnotations);
+      applyPdfEditorState(
+        nextBase64,
+        nextAnnotations,
+        nextPageCount,
+        'view',
+        nextSelectedPage
+      );
+      setShowPageEditorModal(false);
+    } catch (error) {
+      Alert.alert('Page Insert Failed', error.message);
+    } finally {
+      setPageEditorBusy(false);
+    }
+  }, [
+    annotationState,
+    applyPdfEditorState,
+    base64Data,
+    documentKey,
+    getValidatedPageNumber,
+    writeAnnotationSnapshot,
+    writeWorkingPdfCopy,
+  ]);
+
+  const insertImagePdfPage = useCallback(async () => {
+    const pageNumber = getValidatedPageNumber(true);
+    if (!pageNumber || !base64Data || !documentKey) {
+      return;
+    }
+
+    try {
+      setPageEditorBusy(true);
+      const imageResult = await DocumentPicker.getDocumentAsync({
+        type: ['image/png', 'image/jpeg'],
+        copyToCacheDirectory: true,
+      });
+
+      if (imageResult.canceled) {
+        return;
+      }
+
+      const imageAsset = imageResult.assets[0];
+      const mimeType = imageAsset.mimeType || '';
+      const extension = imageAsset.name.split('.').pop().toLowerCase();
+      const isPng = mimeType === 'image/png' || extension === 'png';
+      const isJpeg =
+        mimeType === 'image/jpeg' || extension === 'jpg' || extension === 'jpeg';
+
+      if (!isPng && !isJpeg) {
+        Alert.alert('Unsupported Image', 'Please choose a PNG or JPEG image.');
+        return;
+      }
+
+      const pdfDocument = await PDFDocument.load(base64Data);
+      const pages = pdfDocument.getPages();
+      const referencePage = pages[Math.min(pageNumber - 1, pages.length - 1)];
+      const { width, height } = referencePage.getSize();
+      const newPage = pdfDocument.insertPage(pageNumber, [width, height]);
+      const imageBase64 = await LegacyFileSystem.readAsStringAsync(imageAsset.uri, {
+        encoding: LegacyFileSystem.EncodingType.Base64,
+      });
+      const embeddedImage = isPng
+        ? await pdfDocument.embedPng(imageBase64)
+        : await pdfDocument.embedJpg(imageBase64);
+      const imageDimensions = embeddedImage.scale(1);
+      const margin = 24;
+      const scaleFactor = Math.min(
+        (width - margin * 2) / imageDimensions.width,
+        (height - margin * 2) / imageDimensions.height,
+        1
+      );
+      const drawWidth = imageDimensions.width * scaleFactor;
+      const drawHeight = imageDimensions.height * scaleFactor;
+
+      newPage.drawImage(embeddedImage, {
+        x: (width - drawWidth) / 2,
+        y: (height - drawHeight) / 2,
+        width: drawWidth,
+        height: drawHeight,
+      });
+
+      const nextAnnotations = insertPageIntoAnnotationState(annotationState, pageNumber);
+      const nextBase64 = await pdfDocument.saveAsBase64();
+      const nextPageCount = pdfDocument.getPageCount();
+      const nextSelectedPage = Math.min(pageNumber + 1, nextPageCount);
+
+      await annotationWriteQueueRef.current;
+      await writeWorkingPdfCopy(documentKey, nextBase64);
+      await writeAnnotationSnapshot(documentKey, nextAnnotations);
+      applyPdfEditorState(
+        nextBase64,
+        nextAnnotations,
+        nextPageCount,
+        'view',
+        nextSelectedPage
+      );
+      setShowPageEditorModal(false);
+    } catch (error) {
+      Alert.alert('Image Page Failed', error.message);
+    } finally {
+      setPageEditorBusy(false);
+    }
+  }, [
+    annotationState,
+    applyPdfEditorState,
+    base64Data,
+    documentKey,
+    getValidatedPageNumber,
+    writeAnnotationSnapshot,
+    writeWorkingPdfCopy,
+  ]);
+
   const saveAnnotatedPdf = useCallback(async () => {
-    if (!base64Data || documentType !== 'pdf') {
+    if (documentType !== 'pdf') {
       return;
     }
 
     try {
       setSavingAnnotatedPdf(true);
-
-      const pdfDocument = await PDFDocument.load(base64Data);
-      const noteFont = await pdfDocument.embedFont(StandardFonts.Helvetica);
-      const pages = pdfDocument.getPages();
-
-      Object.entries(annotationState).forEach(([pageKey, pageAnnotations]) => {
-        const page = pages[Number(pageKey) - 1];
-        if (!page) {
-          return;
-        }
-
-        const { width, height } = page.getSize();
-
-        (pageAnnotations.highlights || []).forEach((highlight) => {
-          const highlightWidth = clamp(Number(highlight.width) || 0, 0, 1) * width;
-          const highlightHeight = clamp(Number(highlight.height) || 0, 0, 1) * height;
-
-          if (highlightWidth < 1 || highlightHeight < 1) {
-            return;
-          }
-
-          const { color, opacity } = parseHexColor(highlight.color, 0.4);
-          const x = clamp(Number(highlight.x) || 0, 0, 1) * width;
-          const y =
-            height -
-            (clamp(Number(highlight.y) || 0, 0, 1) + clamp(Number(highlight.height) || 0, 0, 1)) *
-              height;
-
-          page.drawRectangle({
-            x,
-            y,
-            width: highlightWidth,
-            height: highlightHeight,
-            color,
-            opacity,
-            blendMode: BlendMode.Multiply,
-          });
-        });
-
-        (pageAnnotations.drawings || []).forEach((drawing) => {
-          const pdfPoints = (drawing.points || []).map((point) =>
-            normalizePdfPoint(point, width, height)
-          );
-
-          if (!pdfPoints.length) {
-            return;
-          }
-
-          const { color, opacity } = parseHexColor(drawing.color, 1);
-          const thickness = Math.max(
-            clamp(Number(drawing.width) || 0.006, 0.001, 0.05) * width,
-            1.2
-          );
-
-          if (pdfPoints.length === 1) {
-            page.drawCircle({
-              x: pdfPoints[0].x,
-              y: pdfPoints[0].y,
-              size: Math.max(thickness / 2, 0.8),
-              color,
-              opacity,
-            });
-            return;
-          }
-
-          for (let index = 0; index < pdfPoints.length - 1; index += 1) {
-            page.drawLine({
-              start: pdfPoints[index],
-              end: pdfPoints[index + 1],
-              thickness,
-              color,
-              opacity,
-              lineCap: LineCapStyle.Round,
-            });
-          }
-        });
-
-        (pageAnnotations.notes || []).forEach((note) => {
-          const fontSize = 12;
-          const lineHeight = fontSize * 1.25;
-          const maxTextWidth = Math.min(width * 0.35, 180);
-          const lines = wrapNoteText(note.text, noteFont, fontSize, maxTextWidth);
-          const textWidth = lines.reduce((currentWidth, line) => {
-            const measuredWidth = noteFont.widthOfTextAtSize(line || ' ', fontSize);
-            return Math.max(currentWidth, measuredWidth);
-          }, 40);
-
-          const noteWidth = Math.min(textWidth + 14, width * 0.42);
-          const noteHeight = Math.max(lines.length * lineHeight + 14, 28);
-          const x = clamp(
-            (Number(note.x) || 0) * width,
-            8,
-            Math.max(width - noteWidth - 8, 8)
-          );
-          const y = clamp(
-            height - (clamp(Number(note.y) || 0, 0, 1) * height) - noteHeight,
-            8,
-            Math.max(height - noteHeight - 8, 8)
-          );
-
-          page.drawRectangle({
-            x,
-            y,
-            width: noteWidth,
-            height: noteHeight,
-            color: rgb(1, 0.976, 0.769),
-            borderWidth: 1,
-            borderColor: rgb(0.976, 0.659, 0.145),
-            opacity: 0.98,
-          });
-
-          lines.forEach((line, index) => {
-            page.drawText(line, {
-              x: x + 7,
-              y: y + noteHeight - 9 - fontSize - index * lineHeight,
-              size: fontSize,
-              font: noteFont,
-              color: rgb(0.2, 0.2, 0.2),
-            });
-          });
-        });
-      });
-
-      const bakedPdfBase64 = await pdfDocument.saveAsBase64();
-      const fileName = buildAnnotatedFileName(documentName);
-      const outputUri = `${Paths.document.uri}${fileName}`;
-
-      await LegacyFileSystem.writeAsStringAsync(outputUri, bakedPdfBase64, {
-        encoding: LegacyFileSystem.EncodingType.Base64,
-      });
+      const { bakedPdfBase64, fileName, outputUri } = await buildEditedPdfFile(
+        Paths.document.uri
+      );
 
       const deviceSaveResult =
         Platform.OS === 'android'
@@ -760,7 +1295,7 @@ export default function App() {
     } finally {
       setSavingAnnotatedPdf(false);
     }
-  }, [annotationState, base64Data, documentName, documentType]);
+  }, [buildEditedPdfFile, documentType]);
 
   const handleWebViewMessage = useCallback(
     (event) => {
@@ -783,6 +1318,17 @@ export default function App() {
             break;
           case 'annotationSelected':
             setSelectedAnnotation(data.annotation || null);
+            break;
+          case 'pageSelected':
+            if (Number.isInteger(data.page)) {
+              setPageNumberInput(String(data.page));
+            }
+            break;
+          case 'pageLongPressed':
+            if (Number.isInteger(data.page)) {
+              setPageNumberInput(String(data.page));
+            }
+            setShowPageEditorModal(true);
             break;
           case 'annotationsChanged': {
             const nextAnnotations = normalizeAnnotationState(data.annotations);
@@ -937,6 +1483,16 @@ export default function App() {
                 <>
                   <TouchableOpacity
                     style={[
+                      styles.actionBtn,
+                      pageEditorBusy && styles.actionBtnDisabled,
+                    ]}
+                    disabled={pageEditorBusy}
+                    onPress={() => setShowPageEditorModal(true)}
+                  >
+                    <Text style={styles.actionBtnText}>📑 Pages</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[
                       styles.actionBtnPrimary,
                       savingAnnotatedPdf && styles.actionBtnDisabled,
                     ]}
@@ -1027,7 +1583,7 @@ export default function App() {
 
           {documentType === 'pdf' && viewerHtml ? (
             <WebView
-              key={documentKey || documentUri}
+              key={`${documentKey || documentUri}-${viewerInstanceId}`}
               ref={webViewRef}
               source={{ html: viewerHtml }}
               style={styles.webView}
@@ -1081,6 +1637,79 @@ export default function App() {
               </TouchableOpacity>
               <TouchableOpacity style={styles.modalBtnSubmit} onPress={submitTextNote}>
                 <Text style={styles.modalBtnSubmitText}>Add Note</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={showPageEditorModal}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setShowPageEditorModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>Edit PDF Pages</Text>
+            <Text style={styles.pageEditorHint}>
+              Tap a page to select it. Long-press any page to open this panel
+              for that page instantly.
+            </Text>
+            <Text style={styles.pageEditorMeta}>
+              Current pages: {totalPages}
+            </Text>
+            <View style={styles.pageSelectionCard}>
+              <Text style={styles.pageSelectionLabel}>Selected page</Text>
+              <Text style={styles.pageSelectionValue}>
+                {Number.parseInt(pageNumberInput, 10) || 1}
+              </Text>
+              <Text style={styles.pageSelectionHint}>
+                Remove deletes this page. Blank and image add a new page after it.
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={[
+                styles.pageActionBtn,
+                pageEditorBusy && styles.actionBtnDisabled,
+              ]}
+              disabled={pageEditorBusy}
+              onPress={removePdfPage}
+            >
+              <Text style={styles.pageActionBtnText}>🗑 Remove This Page</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.pageActionBtnPrimary,
+                pageEditorBusy && styles.actionBtnDisabled,
+              ]}
+              disabled={pageEditorBusy}
+              onPress={insertBlankPdfPage}
+            >
+              <Text style={styles.pageActionBtnPrimaryText}>
+                ➕ Add Blank Page After
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.pageActionBtnPrimary,
+                pageEditorBusy && styles.actionBtnDisabled,
+              ]}
+              disabled={pageEditorBusy}
+              onPress={insertImagePdfPage}
+            >
+              <Text style={styles.pageActionBtnPrimaryText}>
+                🖼 Add Image Page After
+              </Text>
+            </TouchableOpacity>
+            <View style={styles.modalButtons}>
+              <TouchableOpacity
+                style={styles.modalBtnCancel}
+                onPress={() => setShowPageEditorModal(false)}
+              >
+                <Text style={styles.modalBtnCancelText}>
+                  {pageEditorBusy ? 'Working...' : 'Close'}
+                </Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -1469,6 +2098,71 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#333',
     marginBottom: 16,
+  },
+  pageEditorHint: {
+    color: '#4f5b7a',
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 8,
+  },
+  pageEditorMeta: {
+    color: '#6f7891',
+    fontSize: 12,
+    marginBottom: 14,
+  },
+  pageSelectionCard: {
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 13,
+    backgroundColor: '#eef5ff',
+    borderWidth: 1,
+    borderColor: '#c8daf7',
+    marginBottom: 16,
+  },
+  pageSelectionLabel: {
+    color: '#53709f',
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 4,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  pageSelectionValue: {
+    color: '#17335c',
+    fontSize: 28,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  pageSelectionHint: {
+    color: '#50637f',
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  pageActionBtn: {
+    backgroundColor: '#8b1e2d',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 10,
+    marginBottom: 10,
+  },
+  pageActionBtnPrimary: {
+    backgroundColor: '#0d6e6e',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 10,
+    marginBottom: 10,
+  },
+  pageActionBtnText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  pageActionBtnPrimaryText: {
+    color: '#f1ffff',
+    fontSize: 14,
+    fontWeight: '600',
+    textAlign: 'center',
   },
   modalInput: {
     borderWidth: 1,
