@@ -90,6 +90,11 @@ export function getPdfViewerHtml(base64Data, options = {}) {
         0 0 0 4px rgba(25, 118, 210, 0.92),
         0 10px 22px rgba(0, 0, 0, 0.24);
       transform: translateY(-1px);
+      cursor: grab;
+    }
+    .highlight-rect.dragging,
+    .text-note.dragging {
+      cursor: grabbing;
     }
     .draw-canvas {
       position: absolute;
@@ -143,6 +148,8 @@ export function getPdfViewerHtml(base64Data, options = {}) {
     let pdfDoc = null;
     let totalPages = 0;
     let selectedAnnotation = null;
+    let activeDrag = null;
+    let suppressNextClick = false;
     const pageMetrics = {};
 
     pdfjsLib.GlobalWorkerOptions.workerSrc =
@@ -306,6 +313,169 @@ export function getPdfViewerHtml(base64Data, options = {}) {
       };
     }
 
+    function getNormalizedBounds(points) {
+      if (!points.length) {
+        return null;
+      }
+
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+
+      points.forEach((point) => {
+        minX = Math.min(minX, point.x);
+        minY = Math.min(minY, point.y);
+        maxX = Math.max(maxX, point.x);
+        maxY = Math.max(maxY, point.y);
+      });
+
+      return {
+        minX,
+        minY,
+        maxX,
+        maxY,
+      };
+    }
+
+    function isSelectedAnnotation(type, pageNum, id) {
+      return (
+        !!selectedAnnotation &&
+        selectedAnnotation.type === type &&
+        selectedAnnotation.page === Number(pageNum) &&
+        selectedAnnotation.id === id
+      );
+    }
+
+    function getAnnotationBucket(pageAnnotations, type) {
+      if (type === 'highlight') {
+        return pageAnnotations.highlights;
+      }
+      if (type === 'note') {
+        return pageAnnotations.notes;
+      }
+      if (type === 'drawing') {
+        return pageAnnotations.drawings;
+      }
+      return [];
+    }
+
+    function updateElementPositionFromAnnotation(element, annotation, pageNum) {
+      const metric = getPageMetric(pageNum);
+      if (!metric || !element) {
+        return;
+      }
+
+      element.style.left = annotation.x * metric.displayWidth + 'px';
+      element.style.top = annotation.y * metric.displayHeight + 'px';
+    }
+
+    function beginDrag(config, event) {
+      activeDrag = {
+        ...config,
+        hasMoved: false,
+        startCoords: getEventCoords(event),
+      };
+
+      if (config.element) {
+        config.element.classList.add('dragging');
+      }
+    }
+
+    function updateActiveDrag(event) {
+      if (!activeDrag) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const currentCoords = getEventCoords(event);
+      const deltaClientX = currentCoords.clientX - activeDrag.startCoords.clientX;
+      const deltaClientY = currentCoords.clientY - activeDrag.startCoords.clientY;
+
+      if (
+        !activeDrag.hasMoved &&
+        Math.sqrt(deltaClientX * deltaClientX + deltaClientY * deltaClientY) < 3
+      ) {
+        return;
+      }
+
+      activeDrag.hasMoved = true;
+      const metric = getPageMetric(activeDrag.pageNum);
+      if (!metric) {
+        return;
+      }
+
+      const deltaX = deltaClientX / metric.displayWidth;
+      const deltaY = deltaClientY / metric.displayHeight;
+
+      if (activeDrag.kind === 'element') {
+        activeDrag.annotation.x = clamp(
+          activeDrag.startX + deltaX,
+          0,
+          Math.max(1 - activeDrag.width, 0)
+        );
+        activeDrag.annotation.y = clamp(
+          activeDrag.startY + deltaY,
+          0,
+          Math.max(1 - activeDrag.height, 0)
+        );
+
+        updateElementPositionFromAnnotation(
+          activeDrag.element,
+          activeDrag.annotation,
+          activeDrag.pageNum
+        );
+        return;
+      }
+
+      if (activeDrag.kind === 'drawing') {
+        const bounds = getNormalizedBounds(activeDrag.originalPoints);
+        if (!bounds) {
+          return;
+        }
+
+        const clampedDeltaX = clamp(deltaX, -bounds.minX, 1 - bounds.maxX);
+        const clampedDeltaY = clamp(deltaY, -bounds.minY, 1 - bounds.maxY);
+
+        activeDrag.annotation.points = activeDrag.originalPoints.map((point) => ({
+          x: clamp(point.x + clampedDeltaX, 0, 1),
+          y: clamp(point.y + clampedDeltaY, 0, 1),
+        }));
+
+        redrawDrawings(activeDrag.pageNum);
+      }
+    }
+
+    function endActiveDrag(event) {
+      if (!activeDrag) {
+        return;
+      }
+
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+
+      const shouldPersist = activeDrag.hasMoved;
+
+      if (activeDrag.element) {
+        activeDrag.element.classList.remove('dragging');
+      }
+
+      const pageNum = activeDrag.pageNum;
+      activeDrag = null;
+
+      if (shouldPersist) {
+        suppressNextClick = true;
+        if (pageNum) {
+          renderPageAnnotations(pageNum);
+        }
+        persistAnnotations();
+      }
+    }
+
     function findDrawingAtPoint(pageNum, normalizedPoint) {
       const pageAnnotations = ensurePageAnnotations(pageNum);
       const metric = getPageMetric(pageNum);
@@ -400,8 +570,49 @@ export function getPdfViewerHtml(base64Data, options = {}) {
       highlight.style.height = annotation.height * metric.displayHeight + 'px';
       highlight.style.background = annotation.color;
 
+      function handleDragStart(event) {
+        if (currentMode !== 'view') {
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        if (!isSelectedAnnotation('highlight', pageNum, annotation.id)) {
+          selectAnnotation({
+            id: annotation.id,
+            type: 'highlight',
+            page: pageNum,
+          });
+          return;
+        }
+
+        beginDrag(
+          {
+            kind: 'element',
+            annotation,
+            element: highlight,
+            pageNum,
+            startX: annotation.x,
+            startY: annotation.y,
+            width: annotation.width,
+            height: annotation.height,
+          },
+          event
+        );
+      }
+
+      highlight.addEventListener('touchstart', handleDragStart, { passive: false });
+      highlight.addEventListener('mousedown', handleDragStart);
+
       highlight.addEventListener('click', (event) => {
         if (currentMode !== 'view') {
+          return;
+        }
+        if (suppressNextClick) {
+          suppressNextClick = false;
+          event.preventDefault();
+          event.stopPropagation();
           return;
         }
         event.preventDefault();
@@ -434,8 +645,49 @@ export function getPdfViewerHtml(base64Data, options = {}) {
       note.style.left = Math.min(annotation.x * metric.displayWidth, maxX) + 'px';
       note.style.top = Math.min(annotation.y * metric.displayHeight, maxY) + 'px';
 
+      function handleDragStart(event) {
+        if (currentMode !== 'view') {
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        if (!isSelectedAnnotation('note', pageNum, annotation.id)) {
+          selectAnnotation({
+            id: annotation.id,
+            type: 'note',
+            page: pageNum,
+          });
+          return;
+        }
+
+        beginDrag(
+          {
+            kind: 'element',
+            annotation,
+            element: note,
+            pageNum,
+            startX: annotation.x,
+            startY: annotation.y,
+            width: Math.min(note.offsetWidth / metric.displayWidth, 1),
+            height: Math.min(note.offsetHeight / metric.displayHeight, 1),
+          },
+          event
+        );
+      }
+
+      note.addEventListener('touchstart', handleDragStart, { passive: false });
+      note.addEventListener('mousedown', handleDragStart);
+
       note.addEventListener('click', (event) => {
         if (currentMode !== 'view') {
+          return;
+        }
+        if (suppressNextClick) {
+          suppressNextClick = false;
+          event.preventDefault();
+          event.stopPropagation();
           return;
         }
         event.preventDefault();
@@ -594,6 +846,34 @@ export function getPdfViewerHtml(base64Data, options = {}) {
       let startPoint = null;
 
       function onDown(event) {
+        if (
+          currentMode === 'view' &&
+          selectedAnnotation &&
+          selectedAnnotation.type === 'drawing' &&
+          selectedAnnotation.page === Number(pageNum)
+        ) {
+          const point = getNormalizedEventPoint(overlay, event);
+          const drawing = findDrawingAtPoint(pageNum, point);
+
+          if (drawing && drawing.id === selectedAnnotation.id) {
+            event.preventDefault();
+            event.stopPropagation();
+            beginDrag(
+              {
+                kind: 'drawing',
+                annotation: drawing,
+                pageNum,
+                originalPoints: drawing.points.map((dragPoint) => ({
+                  x: dragPoint.x,
+                  y: dragPoint.y,
+                })),
+              },
+              event
+            );
+          }
+          return;
+        }
+
         if (currentMode !== 'highlight' && currentMode !== 'text') {
           return;
         }
@@ -669,6 +949,12 @@ export function getPdfViewerHtml(base64Data, options = {}) {
 
       overlay.addEventListener('click', (event) => {
         if (currentMode !== 'view' || event.target !== overlay) {
+          return;
+        }
+        if (suppressNextClick) {
+          suppressNextClick = false;
+          event.preventDefault();
+          event.stopPropagation();
           return;
         }
 
@@ -825,6 +1111,12 @@ export function getPdfViewerHtml(base64Data, options = {}) {
         clientY: event.clientY,
       };
     }
+
+    document.addEventListener('touchmove', updateActiveDrag, { passive: false });
+    document.addEventListener('touchend', endActiveDrag, { passive: false });
+    document.addEventListener('touchcancel', endActiveDrag, { passive: false });
+    document.addEventListener('mousemove', updateActiveDrag);
+    document.addEventListener('mouseup', endActiveDrag);
 
     function updateInteractionMode() {
       document.querySelectorAll('.annotation-layer').forEach((element) => {
