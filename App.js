@@ -83,6 +83,16 @@ const PDF_CONVERSION_FORMATS = [
     mimeType: 'text/html',
   },
 ];
+const OFFICE_FONT_FAMILY_OPTIONS = [
+  { label: 'Sans', value: 'Arial' },
+  { label: 'Serif', value: 'Georgia' },
+  { label: 'Mono', value: 'Courier New' },
+];
+const OFFICE_FONT_SIZE_OPTIONS = [
+  { label: 'A-', action: 'adjustFontSize', value: -2 },
+  { label: 'A', action: 'resetFontSize', value: 16 },
+  { label: 'A+', action: 'adjustFontSize', value: 2 },
+];
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -918,6 +928,10 @@ export default function App() {
               typeof handleOfficePreviewCommand === 'function' &&
                 handleOfficePreviewCommand(parsed);
               break;
+            case 'officeFormat':
+              typeof handleOfficePreviewCommand === 'function' &&
+                handleOfficePreviewCommand(parsed);
+              break;
           }
         } catch (error) {
           console.error('Command error:', error);
@@ -1127,6 +1141,60 @@ export default function App() {
       title: documentName,
     });
   }, [documentName, officePdfBusy, officePreviewMeta.canConvertToPdf, sendCommand]);
+
+  const sendOfficePreviewCommand = useCallback(
+    (payload) => {
+      sendCommand({
+        command: 'officeFormat',
+        ...payload,
+      });
+    },
+    [sendCommand]
+  );
+
+  const applyOfficeStyleCommand = useCallback(
+    (action, value) => {
+      sendOfficePreviewCommand({ action, value });
+    },
+    [sendOfficePreviewCommand]
+  );
+
+  const applyOfficeTextColor = useCallback(
+    (color) => {
+      setActiveColor(color);
+      sendOfficePreviewCommand({
+        action: 'setColor',
+        value: color,
+      });
+    },
+    [sendOfficePreviewCommand]
+  );
+
+  const insertImageIntoOfficePreview = useCallback(async () => {
+    try {
+      const imageResult = await DocumentPicker.getDocumentAsync({
+        type: 'image/*',
+        copyToCacheDirectory: true,
+      });
+
+      if (imageResult.canceled) {
+        return;
+      }
+
+      const imageAsset = imageResult.assets[0];
+      const imageBase64 = await LegacyFileSystem.readAsStringAsync(imageAsset.uri, {
+        encoding: LegacyFileSystem.EncodingType.Base64,
+      });
+      const dataUrl = `data:${imageAsset.mimeType || 'image/png'};base64,${imageBase64}`;
+
+      sendOfficePreviewCommand({
+        action: 'insertImage',
+        dataUrl,
+      });
+    } catch (error) {
+      Alert.alert('Image Insert Failed', error.message);
+    }
+  }, [sendOfficePreviewCommand]);
 
   const startPdfConversion = useCallback(
     async (formatId) => {
@@ -1719,6 +1787,12 @@ export default function App() {
               );
             }
             break;
+          case 'officePreviewCommandError':
+            Alert.alert(
+              'Office Edit',
+              data.message || 'Select an editable area in the document first.'
+            );
+            break;
           case 'annotationsChanged': {
             const nextAnnotations = normalizeAnnotationState(data.annotations);
             setAnnotationState(nextAnnotations);
@@ -1942,18 +2016,30 @@ export default function App() {
                 </>
               )}
               {documentType !== 'pdf' && officePreviewMeta.canConvertToPdf && (
-                <TouchableOpacity
-                  style={[
-                    styles.actionBtnPrimary,
-                    officePdfBusy && styles.actionBtnDisabled,
-                  ]}
-                  disabled={officePdfBusy}
-                  onPress={convertOfficePreviewToPdf}
-                >
-                  <Text style={styles.actionBtnPrimaryText}>
-                    {officePdfBusy ? '⏳ Converting to PDF...' : '🧾 Convert to PDF'}
-                  </Text>
-                </TouchableOpacity>
+                <>
+                  <TouchableOpacity
+                    style={[
+                      styles.actionBtnPrimary,
+                      officePdfBusy && styles.actionBtnDisabled,
+                    ]}
+                    disabled={officePdfBusy}
+                    onPress={convertOfficePreviewToPdf}
+                  >
+                    <Text style={styles.actionBtnPrimaryText}>
+                      {officePdfBusy ? '⏳ Converting to PDF...' : '🧾 Convert to PDF'}
+                    </Text>
+                  </TouchableOpacity>
+                  {officePreviewMeta.isEditable && (
+                    <TouchableOpacity
+                      style={styles.actionBtn}
+                      onPress={() => setShowToolbar((currentValue) => !currentValue)}
+                    >
+                      <Text style={styles.actionBtnText}>
+                        {showToolbar ? '🔧 Hide Tools' : '🔧 Show Tools'}
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                </>
               )}
             </ScrollView>
           </View>
@@ -1971,8 +2057,9 @@ export default function App() {
           {documentType !== 'pdf' && officePreviewMeta.isEditable && (
             <View style={styles.selectionBar}>
               <Text style={styles.selectionText}>
-                Basic text editing is available in this preview. Use `Convert to PDF`
-                to save the current preview as a PDF copy.
+                Basic editing is available in this preview. Tap an image to select
+                it, then drag the corner handle or use the image resize buttons.
+                Use `Convert to PDF` to save the current preview as a PDF copy.
               </Text>
             </View>
           )}
@@ -2016,6 +2103,94 @@ export default function App() {
                   ))}
                 </View>
               )}
+            </View>
+          )}
+
+          {documentType !== 'pdf' && officePreviewMeta.isEditable && showToolbar && (
+            <View style={styles.toolbar}>
+              <View style={styles.toolRow}>
+                <TouchableOpacity
+                  style={styles.toolBtn}
+                  onPress={() => applyOfficeStyleCommand('bold')}
+                >
+                  <Text style={styles.toolBtnText}>B</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.toolBtn}
+                  onPress={() => applyOfficeStyleCommand('italic')}
+                >
+                  <Text style={styles.toolBtnText}>I</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.toolBtn}
+                  onPress={() => applyOfficeStyleCommand('underline')}
+                >
+                  <Text style={styles.toolBtnText}>U</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.toolBtn}
+                  onPress={insertImageIntoOfficePreview}
+                >
+                  <Text style={styles.toolBtnText}>🖼 Image</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.toolBtn}
+                  onPress={() => applyOfficeStyleCommand('scaleImage', 0.85)}
+                >
+                  <Text style={styles.toolBtnText}>↘ Smaller</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.toolBtn}
+                  onPress={() => applyOfficeStyleCommand('scaleImage', 1.15)}
+                >
+                  <Text style={styles.toolBtnText}>↗ Larger</Text>
+                </TouchableOpacity>
+              </View>
+
+              <View style={styles.officeOptionRow}>
+                {OFFICE_FONT_FAMILY_OPTIONS.map((fontOption) => (
+                  <TouchableOpacity
+                    key={fontOption.value}
+                    style={styles.officeOptionBtn}
+                    onPress={() =>
+                      applyOfficeStyleCommand('setFontFamily', fontOption.value)
+                    }
+                  >
+                    <Text style={styles.officeOptionText}>{fontOption.label}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <View style={styles.officeOptionRow}>
+                {OFFICE_FONT_SIZE_OPTIONS.map((fontSizeOption) => (
+                  <TouchableOpacity
+                    key={fontSizeOption.value}
+                    style={styles.officeOptionBtn}
+                    onPress={() =>
+                      applyOfficeStyleCommand(
+                        fontSizeOption.action,
+                        fontSizeOption.value
+                      )
+                    }
+                  >
+                    <Text style={styles.officeOptionText}>{fontSizeOption.label}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <View style={styles.colorRow}>
+                {COLORS.map((color) => (
+                  <TouchableOpacity
+                    key={color.value}
+                    style={[
+                      styles.colorBtn,
+                      { backgroundColor: color.value },
+                      activeColor === color.value && styles.colorBtnActive,
+                    ]}
+                    onPress={() => applyOfficeTextColor(color.value)}
+                  />
+                ))}
+              </View>
             </View>
           )}
 
@@ -2544,7 +2719,26 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'center',
     marginTop: 8,
+    flexWrap: 'wrap',
     gap: 8,
+  },
+  officeOptionRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    flexWrap: 'wrap',
+    marginTop: 8,
+    gap: 8,
+  },
+  officeOptionBtn: {
+    backgroundColor: '#16213e',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  officeOptionText: {
+    color: '#d5def3',
+    fontSize: 13,
+    fontWeight: '500',
   },
   colorBtn: {
     width: 28,
